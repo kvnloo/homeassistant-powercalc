@@ -65,6 +65,25 @@ def _profile_json_files(changed_files: list[Path], profile_json: ProfileJson) ->
     ]
 
 
+def _missing_manufacturer_json(changed_files: list[Path]) -> list[Path]:
+    """Return manufacturer.json paths required by a changed model.json but absent on disk.
+
+    Profile PRs that introduce a new manufacturer directory often only add model.json
+    and LUT files. Schema validation never sees manufacturer.json in that case, so
+    require the sibling file to exist whenever a model.json is in the change set.
+    """
+    missing: list[Path] = []
+    seen: set[Path] = set()
+    for path in _profile_json_files(changed_files, MODEL_JSON):
+        manufacturer_json = path.parents[1] / MANUFACTURER_JSON.file_name
+        if manufacturer_json in seen:
+            continue
+        seen.add(manufacturer_json)
+        if not manufacturer_json.is_file():
+            missing.append(manufacturer_json)
+    return missing
+
+
 def _validate_files(changed_files: list[Path], schemas: dict[ProfileJson, Path]) -> dict[Path, list[ValidationError]]:
     errors_by_file: dict[Path, list[ValidationError]] = {}
     for profile_json, schema_path in schemas.items():
@@ -81,14 +100,28 @@ def _validated_file_names() -> str:
     return " and ".join(f"`{profile_json.file_name}`" for profile_json in PROFILE_JSON_KINDS)
 
 
-def _build_report(errors_by_file: dict[Path, list[ValidationError]]) -> str:
-    if not errors_by_file:
+def _build_report(
+    errors_by_file: dict[Path, list[ValidationError]],
+    missing_manufacturer: list[Path],
+) -> str:
+    if not errors_by_file and not missing_manufacturer:
         return f"{COMMENT_MARKER}\n\nAll changed {_validated_file_names()} files are valid."
 
-    sections = [COMMENT_MARKER, f"JSON Schema validation failed for changed {_validated_file_names()} files."]
-    for path, errors in errors_by_file.items():
-        sections.append(f"## `{path}`")
-        sections.extend(_format_error(error) for error in errors)
+    sections = [COMMENT_MARKER]
+    if missing_manufacturer:
+        sections.append(
+            "Changed `model.json` files require `manufacturer.json` in the same manufacturer directory."
+        )
+        for path in missing_manufacturer:
+            sections.append(f"## `{path}`")
+            sections.append(
+                "Missing. Add required `name` plus optional `full_name` / `website` / `country` / `aliases`."
+            )
+    if errors_by_file:
+        sections.append(f"JSON Schema validation failed for changed {_validated_file_names()} files.")
+        for path, errors in errors_by_file.items():
+            sections.append(f"## `{path}`")
+            sections.extend(_format_error(error) for error in errors)
 
     return "\n\n".join(sections)
 
@@ -102,15 +135,18 @@ def main() -> int:
     parser.add_argument("--status", type=Path, required=True)
     args = parser.parse_args()
 
+    changed_files = _load_changed_files(args.changed_files)
     errors_by_file = _validate_files(
-        _load_changed_files(args.changed_files),
+        changed_files,
         {MODEL_JSON: args.model_schema, MANUFACTURER_JSON: args.manufacturer_schema},
     )
+    missing_manufacturer = _missing_manufacturer_json(changed_files)
+    failed = bool(errors_by_file or missing_manufacturer)
 
-    args.report.write_text(_build_report(errors_by_file), encoding="utf-8")
-    args.status.write_text("failure" if errors_by_file else "success", encoding="utf-8")
+    args.report.write_text(_build_report(errors_by_file, missing_manufacturer), encoding="utf-8")
+    args.status.write_text("failure" if failed else "success", encoding="utf-8")
 
-    return 1 if errors_by_file else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
