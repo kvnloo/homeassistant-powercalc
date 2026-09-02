@@ -196,3 +196,31 @@ def test_library_manufacturer_and_model_files_validate(tmp_path: Path, monkeypat
 
     assert exit_code == 0
     assert status == "success"
+
+
+def test_model_json_without_manufacturer_json_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new manufacturer directory that only adds model.json must not pass CI."""
+    write_json(tmp_path / "profile_library" / "ledisons" / "ldn22rgbww5" / "model.json", VALID_MODEL)
+
+    exit_code, report, status = run(
+        tmp_path,
+        monkeypatch,
+        ["profile_library/ledisons/ldn22rgbww5/model.json"],
+    )
+
+    assert exit_code == 1
+    assert status == "failure"
+    assert "## `profile_library/ledisons/manufacturer.json`" in report
+    assert "require `manufacturer.json`" in report
+
+
+def test_model_json_reuses_existing_manufacturer_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing manufacturer.json on disk is enough; it does not have to be in the change set."""
+    write_json(tmp_path / "profile_library" / "signify" / "manufacturer.json", VALID_MANUFACTURER)
+    write_json(tmp_path / "profile_library" / "signify" / "LCT010" / "model.json", VALID_MODEL)
+
+    exit_code, report, status = run(tmp_path, monkeypatch, ["profile_library/signify/LCT010/model.json"])
+
+    assert exit_code == 0
+    assert status == "success"
+    assert report == f"{entry.COMMENT_MARKER}\n\nAll changed `model.json` and `manufacturer.json` files are valid."
