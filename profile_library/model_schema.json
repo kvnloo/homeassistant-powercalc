@@ -97,7 +97,10 @@
       "if": {
         "properties": {
           "device_type": {
-            "const": "fan"
+            "enum": [
+              "air_purifier",
+              "fan"
+            ]
           }
         },
         "required": [
@@ -142,6 +145,11 @@
           },
           "only_self_usage": {
             "const": true
+          },
+          "calculation_strategy": {
+            "not": {
+              "const": "multi_switch"
+            }
           }
         },
         "required": [
@@ -191,7 +199,7 @@
       },
       "description": "List of compatible integrations for this model"
     },
-    "ean": {
+    "gtin": {
       "type": "array",
       "uniqueItems": true,
       "items": {
@@ -254,6 +262,10 @@
           "items": {
             "type": "object",
             "properties": {
+              "entity_id": {
+                "type": "string",
+                "description": "Source entity for this strategy and conditions which omit entity_id. Defaults to the parent source entity."
+              },
               "condition": {
                 "$ref": "#/definitions/condition"
               }
@@ -276,6 +288,10 @@
               "items": {
                 "type": "object",
                 "properties": {
+                  "entity_id": {
+                    "type": "string",
+                    "description": "Source entity for this strategy and conditions which omit entity_id. Defaults to the parent source entity."
+                  },
                   "condition": {
                     "$ref": "#/definitions/condition"
                   }
@@ -311,10 +327,13 @@
     "device_type": {
       "type": "string",
       "enum": [
+        "air_conditioner",
+        "air_purifier",
         "camera",
         "cover",
         "fan",
         "generic_iot",
+        "humidifier",
         "light",
         "power_meter",
         "printer",
@@ -327,7 +346,8 @@
         "vacuum_robot",
         "lawn_mower_robot",
         "heating",
-        "ups"
+        "ups",
+        "water_heater"
       ],
       "description": "Type of device"
     },
@@ -357,6 +377,38 @@
             "type": "string",
             "description": "Label of the field"
           },
+          "auto_select": {
+            "type": "object",
+            "description": "Prefill a single entity field when exactly one enabled entity on the source device matches all supplied criteria.",
+            "properties": {
+              "integration": {
+                "type": "string",
+                "minLength": 1
+              },
+              "translation_key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "unique_id_pattern": {
+                "type": "string",
+                "format": "regex",
+                "minLength": 1
+              }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "translation_key"
+                ]
+              },
+              {
+                "required": [
+                  "unique_id_pattern"
+                ]
+              }
+            ],
+            "additionalProperties": false
+          },
           "selector": {
             "type": "object",
             "properties": {
@@ -379,6 +431,32 @@
                   },
                   "max": {
                     "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "if": {
+          "required": [
+            "auto_select"
+          ]
+        },
+        "then": {
+          "required": [
+            "selector"
+          ],
+          "properties": {
+            "selector": {
+              "required": [
+                "entity"
+              ],
+              "properties": {
+                "entity": {
+                  "properties": {
+                    "multiple": {
+                      "const": false
+                    }
                   }
                 }
               }
@@ -440,10 +518,6 @@
           }
         }
       }
-    },
-    "is_dumb_bulb": {
-      "type": "boolean",
-      "description": "The profile is for a dumb light bulb, not having smart capabilities"
     },
     "name": {
       "type": "string",
@@ -522,6 +596,19 @@
         "max_power": {
           "type": "number"
         },
+        "gamma_curve": {
+          "type": "number",
+          "description": "Exponent applied to the normalized entity value before scaling it between min_power and max_power"
+        },
+        "power_curve": {
+          "type": "array",
+          "description": "Normalized input-to-power curve scaled between min_power and max_power",
+          "minItems": 2,
+          "items": {
+            "type": "string",
+            "pattern": "^(?:0(?:\\.\\d+)?|1(?:\\.0+)?) -> (?:0(?:\\.\\d+)?|1(?:\\.0+)?)$"
+          }
+        },
         "calibrate": {
           "type": "array",
           "items": {
@@ -556,6 +643,18 @@
         "power"
       ],
       "additionalProperties": false
+    },
+    "multiply_factor": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "string",
+          "pattern": "^\\[\\[[a-zA-Z0-9_]+\\]\\]$"
+        }
+      ],
+      "description": "Default multiplier for calculated power, as a number or custom field placeholder. An explicit sensor multiply_factor overrides this value. Standby power is not multiplied unless multiply_factor_standby is enabled."
     },
     "only_self_usage": {
       "type": "boolean",

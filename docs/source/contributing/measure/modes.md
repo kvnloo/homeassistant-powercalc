@@ -50,14 +50,11 @@ The generated model uses a `linear` strategy with percentage calibration points.
 
 ## Charging device
 
-Use `Charging device` for devices where charging power can be mapped to battery level. The current device types are:
-
-- `vacuum_robot`
-- `lawn_mower_robot`
+Use `Charging device` for devices where charging power can be mapped to battery level. The Home Assistant app currently offers this for `vacuum_robot`. The CLI also supports `lawn_mower_robot`.
 
 === "Home Assistant app"
 
-    Select the `vacuum` or `lawn_mower` entity when creating the measurement session.
+    Select the `vacuum` entity when creating the measurement session.
 
 === "CLI"
 
@@ -86,12 +83,17 @@ Examples:
 
 - Printer idle power.
 - Camera day mode or night mode.
-- Smart switch self-usage in `on` and `off` states.
+- Set-top box standby power.
 - Network device idle power.
 
 ## Recorder
 
-Use `Recorder` to capture a power pattern for the [Playbook strategy](../../strategies/playbook.md). The runner writes a CSV file with elapsed time and measured power until you stop it with `CTRL+C`.
+Use recording to capture an open-ended power time series. In the Home Assistant app, choose a device type and **Record device states** to create complex-profile source data, or choose **Free measurement** and **Record a Playbook cycle** for a Playbook CSV:
+
+- **A Playbook CSV** writes the existing headerless `elapsed time,power` format used by the [Playbook strategy](../../strategies/playbook.md).
+- **Data for a complex power profile (experimental)** records power together with the state and attributes of selected Home Assistant entities. Vacuum recordings filter attributes as described below. Generic devices can produce fixed profiles from one state or scalar attribute. The vacuum recipe can produce activity-based composite profiles with battery charging calibration when repeated episodes provide sufficient evidence.
+
+The CLI always creates a Playbook CSV and stops when you press `CTRL+C`. The app stops the recorder from the running-session screen.
 
 This is useful for:
 
@@ -100,4 +102,107 @@ This is useful for:
 - Comparing different programs before configuring multiple playbooks.
 - Checking whether a measurement duration is long enough.
 
-Move the resulting CSV into the Home Assistant playbook directory and configure it as described in the [Playbook strategy documentation](../../strategies/playbook.md).
+### Complex-profile recordings
+
+Choose the device type, such as camera, printer, or heating, then **Record device states**. Select the primary entity the Powercalc profile will use. The analyser considers the primary entity's state and scalar attributes.
+Robot vacuums use **Record vacuum and dock activity**, which selects their dedicated recipe automatically.
+The primary entity list follows the domains Powercalc supports for the selected profile type: a camera profile
+uses a `camera` entity, while a set-top box uses a `media_player` entity.
+Optionally add secondary entities whose states explain power changes, such as a camera's day/night sensor or a
+printer's operation-state sensor. The picker shows entities on the primary entity's device or its immediate parent
+or children. These need an unambiguous portable reference;
+installation-specific entity IDs are never written into the generated profile.
+
+Record every relevant state in two separate runs, using **Record more** after the first run. Earlier recordings
+train the model; the latest recording validates it without changing the fitted powers. Every learned value needs
+at least five samples in training and five in the latest run. A single recording is retained with guidance to
+record more. Older saved generic configurations still use their first selected entity as the primary entity.
+
+Choose **Robot vacuum** and **Record vacuum and dock activity** for guided entity selection and dock activity analysis. See [Recording a vacuum and dock](#recording-a-vacuum-and-dock) below for setup and analysis requirements.
+
+Complex recordings use JSON Lines (`.jsonl`). The first record describes the recording and selected entities; every following sample contains a power reading and entity map. This lets the recorder stream samples safely without holding the complete recording in memory:
+
+```json
+{"record_type":"metadata","format_version":1,"recipe":"vacuum_robot","primary_entity_id":"vacuum.robot","entities":[{"entity_id":"vacuum.robot","domain":"vacuum","role":"primary"},{"entity_id":"sensor.robot_battery","domain":"sensor","role":"battery"}]}
+{"record_type":"sample","elapsed_seconds":0.0,"power":4.2,"entities":{"vacuum.robot":{"state":"cleaning","attributes":{"battery_level":42}},"sensor.robot_battery":{"state":"42","attributes":{"unit_of_measurement":"%"}}}}
+```
+
+Stopping the recording starts analysis automatically. The result includes `analyser.json`. Generic profiles require
+at least 90% validation coverage and enough improvement over a constant-power baseline. Each learned state's
+mean absolute error must also stay within the larger of 20% of its measured mean power or 0.5 W. Vacuum analysis
+uses independent recordings or whole episodes and checks error and coverage for every activity. A `model.json`
+is added only when the applicable checks pass. Otherwise, the recording completes with an explanation of what
+additional evidence is needed.
+
+Generic analysis fits one categorical input at a time, with 2–20 distinct values. A primary state or attribute
+produces a fixed profile; a secondary entity state produces a `stop_at_first` composite. It does not yet combine
+multiple signals or fit continuous curves. Device type selects the profile category, not a different fitting recipe.
+
+Because this includes entity attributes, inspect the file for installation-specific or sensitive values before sharing it.
+While recording, the measurement screen shows the latest state of every tracked entity beneath the live power chart. Recorded attributes remain in the JSON Lines file rather than the live view.
+
+For a Playbook recording, move the resulting CSV into the Home Assistant playbook directory and configure it as described in the [Playbook strategy documentation](../../strategies/playbook.md).
+
+### Recording a vacuum and dock
+
+Choose **Robot vacuum** and **Record vacuum and dock activity**. Select the vacuum and its battery percentage
+sensor. The battery sensor must belong to the same Home Assistant device; the app selects it automatically when
+exactly one usable sensor is available. The app preselects the other enabled entities with live states on that device. You can
+remove entities or add dock entities belonging to another device. Camera and image entities are not selected
+automatically. Changing the selected vacuum resets these defaults; reopening a saved configuration preserves your
+selections.
+
+Measure the entire dock at the wall outlet. Start with a low battery and record charging through completion,
+idle, cleaning, mop washing, auto-emptying, and drying where supported. Repeat cycles to allow validation against
+independent runs rather than nearby samples from the same cycle.
+
+The selected entity list is fixed for the run. `record.jsonl` includes entity roles, integration, translation keys,
+device classes, units, and device associations when available. Its device inventory also lists disabled entities
+without recording their states or enabling them. Enable any useful missing entities in Home Assistant before
+starting a new recording.
+
+Vacuum recordings keep bounded scalar attributes, omitting nested payloads, long strings, URL values, and common
+network, location, and credential attributes. The metadata describes this filtering policy. Recordings still contain
+entity IDs and other device data: review them before sharing. If an optional entity disappears, its state is recorded
+as `unavailable`, with a warning, while power readings continue. Missing required vacuum or battery entities cause
+that sample to be skipped.
+
+Automatic analysis is experimental. The vacuum recipe can generate a small `stop_at_first` composite profile: measured dock
+activities use a fixed power, their time-weighted average, and charging uses a battery-level calibration curve.
+The average keeps the energy of cycling loads, such as a drying heater that switches on and off.
+
+Repeat every observed activity in at least two independent episodes, with at least five samples per episode.
+Record washing, drying, auto-emptying, charging, sleep/standby, and operation away from the dock where supported.
+Capture continuous charging over at least 20 battery percentage points, and charge over the same battery range
+at least twice. Let every cycle finish, for example until drying ends. A single run is useful source data but does
+not provide independent evidence for automatic profile generation.
+
+The analyser uses recognised runtime status sensors or active activity flags, not settings such as an
+**auto drying enabled** switch. A dock action switch that is on while the dock works, such as Roborock's
+**Mop drying** switch, is an activity signal; the analyser prefers it over deprecated sensors reporting the same
+activity.
+
+Selected entities become portable profile placeholders when PowerCalc resolves them to exactly that entity: a unique
+translation key or battery device class on the vacuum's device. Entities on a related device qualify when the
+vacuum's device has no match and the key is unique across related devices. Related devices are immediate parent or child
+devices and Roborock docks, the devices that PowerCalc searches for profile entities. The recording stores these devices and
+their entities, so recordings made before this was supported cannot use dock entities. For older recordings,
+matching `battery_level` attributes can supply charging data.
+Unrecognised modes or unreliable overlaps cause a request for more data; the analyser does not infer an additive
+charging-plus-drying model or insert an unmeasured zero-power fallback.
+
+To add runs to a session, choose **Record more** on its result page. The app keeps earlier runs as
+`record-1.jsonl`, `record-2.jsonl`, and so on, and analyses all runs together, using the entities and settings of
+the first run. Start a new session after updating the app, as the analysis uses the metadata of the session's first
+recording.
+
+Validation holds out whole episodes rather than nearby samples from the same episode. With several recordings, the
+analyser fits the model on the earlier runs and validates it on the latest, when that run covers at least 10% of
+every activity's recorded time. Otherwise it alternates whole episodes of each activity between fitting and
+validation. The analyser's Python API also accepts several compatible recording paths.
+
+Every activity must estimate at least 90% of its validation samples. Charging is validated per sample: its mean
+error must be within 20% of its average power, or within 0.5 W. Fixed-power activities are validated on energy: their
+predicted average power must be within 20% of the measured average, or within 0.5 W. Inspect `analyser.json` for per-activity coverage, typical and transition errors, and measured versus
+predicted energy. Energy is integrated only across adjacent covered validation samples, without bridging gaps or
+activity boundaries. Generated profiles still need contributor testing before submission.

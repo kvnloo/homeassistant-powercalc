@@ -1,9 +1,9 @@
 import logging
 from statistics import mean
 
-from measure.execution import ImmediateInteraction, RunInteraction
 from measure.request import AverageMeasurementRequest
-from measure.util.measure_util import MeasurementResult, MeasureUtil
+from measure.runner.interaction import ImmediateInteraction, RunInteraction
+from measure.utils.sampling import PowerSampler
 
 from .runner import MeasurementRunner, RunnerResult
 
@@ -15,11 +15,12 @@ _LOGGER = logging.getLogger("measure")
 class AverageRunner(MeasurementRunner[AverageMeasurementRequest]):
     def __init__(
         self,
-        measure_util: MeasureUtil,
+        sampler: PowerSampler,
         interaction: RunInteraction | None = None,
     ) -> None:
-        self.measure_util = measure_util
+        self.sampler = sampler
         self.duration = 60
+        self.elapsed = 0.0
         self.interaction = interaction or ImmediateInteraction()
 
     def run(
@@ -28,14 +29,18 @@ class AverageRunner(MeasurementRunner[AverageMeasurementRequest]):
         export_directory: str,
     ) -> RunnerResult:
         self.duration = request.duration
-        self.interaction.confirm("Ready to start the average measurement.")
+        self.elapsed = float(self.duration)
         self.interaction.phase("Starting averaging")
 
-        result = self.measure_util.take_average_measurement(self.duration, on_progress=self._report_progress)
+        result = self.sampler.take_average_measurement(
+            self.duration,
+            on_progress=self._report_progress,
+            finish_on_interrupt=True,
+        )
 
         summary = {
             "Average power": f"{round(result.power, 2)} W",
-            "Duration": f"{self.duration} s",
+            "Duration": f"{round(self.elapsed, 1):g} s",
         }
         if result.voltages:
             summary["Average voltage"] = f"{round(mean(result.voltages), 1)} V"
@@ -43,12 +48,10 @@ class AverageRunner(MeasurementRunner[AverageMeasurementRequest]):
         return RunnerResult(model_json_data={}, voltages=result.voltages, summary=summary)
 
     def _report_progress(self, elapsed: float, duration: float) -> None:
+        self.elapsed = elapsed
         self.interaction.progress(
             int(min(elapsed, duration)),
             int(duration),
             phase="Averaging",
             remaining_seconds=max(0.0, duration - elapsed),
         )
-
-    def measure_standby_power(self) -> MeasurementResult:
-        return MeasurementResult(power=0, voltages=[])

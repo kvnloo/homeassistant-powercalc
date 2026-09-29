@@ -3,8 +3,11 @@
 import logging
 import os
 from pathlib import Path
+import re
+import shlex
 import sys
 from typing import Any, cast
+from uuid import uuid4
 
 import inquirer
 from inquirer.errors import ValidationError
@@ -12,6 +15,14 @@ from inquirer.questions import Question
 from inquirer.render import ConsoleRender
 
 from measure.assembler import MeasurementAssembler
+from measure.cli.const import (
+    QUESTION_ENTITY_ID,
+    QUESTION_GENERATE_MODEL_JSON,
+    QUESTION_MEASURE_DEVICE,
+    QUESTION_MODE,
+    QUESTION_MODEL_ID,
+    QUESTION_MODEL_NAME,
+)
 from measure.cli.dummy_load import (
     CliDummyLoadCalibrationStore,
     apply_dummy_load_answers,
@@ -22,30 +33,22 @@ from measure.cli.environment import CliEnvironment
 from measure.cli.interaction import ConsoleInteraction
 from measure.cli.measurements import measurement_questions
 from measure.cli.request_adapter import request_from_answers
-from measure.const import (
-    MEASURE_TYPE_LABELS,
-    PROJECT_DIR,
-    QUESTION_ENTITY_ID,
-    QUESTION_GENERATE_MODEL_JSON,
-    QUESTION_MEASURE_DEVICE,
-    QUESTION_MODEL_ID,
-    QUESTION_MODEL_NAME,
-    MeasureType,
-    parse_measure_type,
-)
+from measure.const import MEASURE_TYPE_LABELS, PROJECT_DIR, MeasureType, parse_measure_type
 from measure.controller.charging.const import ChargingControllerType
 from measure.controller.errors import ControllerError
 from measure.controller.fan.const import FanControllerType
 from measure.controller.light.const import LightControllerType, LutMode
 from measure.controller.media.const import MediaControllerType
 from measure.execution import MeasurementExecution
-from measure.home_assistant import HomeAssistantManager
-from measure.home_assistant_entities import HomeAssistantEntityCatalog
+from measure.home_assistant.client import HomeAssistantManager
+from measure.home_assistant.entities import HomeAssistantEntityCatalog
 from measure.powermeter.const import PowerMeterType
 from measure.powermeter.errors import PowerMeterError
-from measure.runner.const import QUESTION_MODE
+from measure.powermeter.spec import HassPowerMeterSpec
+from measure.request import SmartSwitchMeasurementRequest
 from measure.runner.errors import RunnerError
-from measure.version import measure_version
+from measure.start import MEASUREMENT_STARTS
+from measure.utils.version import measure_version
 
 config = CliEnvironment()
 
@@ -59,7 +62,7 @@ logging.basicConfig(
 )
 
 # homeassistant_api logs every websocket exchange at INFO; only surface those when debugging.
-if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
+if logging.getLogger().getEffectiveLevel() > logging.DEBUG:  # pragma: no branch - import-time logging configuration
     logging.getLogger("homeassistant_api").setLevel(logging.WARNING)
 
 
@@ -67,6 +70,7 @@ MODEL_ID_EXAMPLES = {
     MeasureType.LIGHT: "LED1837R5",
     MeasureType.SPEAKER: "One SL",
     MeasureType.FAN: "AM07",
+    MeasureType.SMART_SWITCH: "SHSW-25",
 }
 
 _LOGGER = logging.getLogger("measure")
@@ -98,9 +102,12 @@ class Measure:
             entity_catalog = self._home_assistant_entity_catalog() if self._uses_home_assistant() else None
             specific_questions = measurement_questions(self.measure_type, self.config, entity_catalog)
             answers = self.ask_questions(self.get_questions(specific_questions))
-            interaction = ConsoleInteraction()
+            self._prefill_device_metadata(answers)
+            interaction = ConsoleInteraction(MEASUREMENT_STARTS[self.measure_type])
             request = request_from_answers(self.measure_type, answers, self.config)
             request = apply_dummy_load_answers(request, answers, self._dummy_load_calibration_store)
+            if isinstance(request, SmartSwitchMeasurementRequest):
+                self._validate_smart_switch_selection(request)
             if self._uses_home_assistant():
                 self._home_assistant_manager()
             prepared = MeasurementAssembler(
@@ -114,12 +121,28 @@ class Measure:
                     self.config.shelly_password if self.config.selected_power_meter == PowerMeterType.SHELLY else None
                 ),
             ).assemble(request)
-            model_id = str(answers.get(QUESTION_MODEL_ID, "generic"))
+            model_id = request.model_id or (
+                "generic"
+                if self.measure_type in (MeasureType.AVERAGE, MeasureType.RECORDER)
+                else f"session-{uuid4().hex}"
+            )
             execution = MeasurementExecution(
                 measurement=prepared,
                 output_directory=Path(PROJECT_DIR) / "export" / model_id,
             )
-            execution.run()
+            _LOGGER.info("Measurement output directory: %s", execution.output_directory)
+            try:
+                execution.run()
+            except KeyboardInterrupt, Exception:
+                _LOGGER.warning("Measurement stopped. Any saved output is kept in %s", execution.output_directory)
+                if self.measure_type == MeasureType.LIGHT:
+                    _LOGGER.warning(
+                        "To resume, run from the measure directory with the same device and settings, "
+                        "then accept the resume prompt if saved rows are found:\n"
+                        "RESUME=true MODEL_ID=%s uv run --extra cli python -m measure.measure",
+                        shlex.quote(model_id),
+                    )
+                raise
         finally:
             if self._home_assistant is not None:
                 self._home_assistant.close()
@@ -131,6 +154,11 @@ class Measure:
                 "Measurement session finished. Files exported to %s",
                 execution.output_directory,
             )
+            if request.generate_model_json:
+                _LOGGER.info(
+                    "Next, add product metadata and validate the profile:\nuv run powercalc-profile prepare %s",
+                    shlex.quote(str(execution.output_directory)),
+                )
 
     def _select_measure_type(self) -> None:
         if self.config.selected_measure_type:
@@ -179,13 +207,13 @@ class Measure:
                     name=QUESTION_MODEL_ID,
                     message=f"Specify the model id. e.g. {MODEL_ID_EXAMPLES.get(self.measure_type, 'LED1837R5')}",
                     default=self._default_model_id,
-                    validate=validate_required,
+                    # Keep environment overrides compatible; metadata is edited in Prepare.
+                    ignore=True,
                 ),
                 inquirer.Text(
                     name=QUESTION_MODEL_NAME,
                     message=f"Specify the full {self.measure_type} model name",
-                    ignore=lambda answers: not answers.get(QUESTION_GENERATE_MODEL_JSON),
-                    validate=validate_required,
+                    ignore=True,
                 ),
                 inquirer.Text(
                     name=QUESTION_MEASURE_DEVICE,
@@ -216,6 +244,41 @@ class Measure:
                 self._model_id_defaults[entity_id] = None
         return self._model_id_defaults[entity_id]
 
+    def _prefill_device_metadata(self, answers: dict[str, Any]) -> None:
+        """Retain known HA product details without prompting for library metadata."""
+        entity_id = str(answers.get(QUESTION_ENTITY_ID, "")).strip()
+        if not entity_id or not self._uses_home_assistant():
+            return
+        try:
+            entity = self._home_assistant_entity_catalog().load_snapshot().get(entity_id)
+        except Exception as error:  # noqa: BLE001 - metadata must not prevent measurement
+            _LOGGER.warning("Could not prefill device details for %s: %s", entity_id, error)
+            return
+        if entity is None:
+            return
+        model_id = entity.model_id or ""
+        if (
+            not answers.get(QUESTION_MODEL_ID)
+            and len(model_id) <= 120
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()+-]*", model_id)
+        ):
+            answers[QUESTION_MODEL_ID] = model_id
+        if not answers.get(QUESTION_MODEL_NAME):
+            answers[QUESTION_MODEL_NAME] = entity.product_name or ""
+
+    def _validate_smart_switch_selection(self, request: SmartSwitchMeasurementRequest) -> None:
+        snapshot = self._home_assistant_entity_catalog().load_snapshot()
+        relays = [snapshot.get(entity_id) for entity_id in request.controller.entity_ids]
+        if any(relay is None or relay.state not in {"on", "off"} for relay in relays):
+            raise ValueError("Every selected switch relay must be available and report on or off")
+        device_ids = {relay.device_id for relay in relays if relay is not None}
+        if None in device_ids or len(device_ids) != 1:
+            raise ValueError("All selected relays must belong to the same Home Assistant device")
+        if isinstance(request.power_meter, HassPowerMeterSpec):
+            meter = snapshot.get(request.power_meter.entity_id)
+            if meter is None or meter.device_id in device_ids:
+                raise ValueError("Measure switch self consumption with an external power meter")
+
     def _home_assistant_manager(self) -> HomeAssistantManager:
         if self._home_assistant is None:
             self._home_assistant = HomeAssistantManager(self.config.hass_url, self.config.hass_token)
@@ -228,7 +291,8 @@ class Measure:
 
     def _uses_home_assistant(self) -> bool:
         return (
-            self.config.selected_power_meter == PowerMeterType.HASS
+            self.measure_type == MeasureType.SMART_SWITCH
+            or self.config.selected_power_meter == PowerMeterType.HASS
             or (
                 self.measure_type == MeasureType.LIGHT
                 and self.config.selected_light_controller == LightControllerType.HASS
@@ -309,5 +373,5 @@ def main() -> None:
         sys.exit(1)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - entry-point behaviour is tested through main
     main()

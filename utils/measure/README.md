@@ -11,6 +11,10 @@ See the [measure documentation](https://docs.powercalc.nl/contributing/measure/)
 
 The sections below cover development of the measure tool itself.
 
+For package ownership and dependency boundaries, see [Package layout](PACKAGE_LAYOUT.md).
+For the Measure app's recorder, offline fitting, validation, generated models, and component
+boundaries, see [Recorder and analyser architecture](RECORDER_ANALYSER_ARCHITECTURE.md).
+
 ## Development setup
 
 **Prerequisites:**
@@ -30,6 +34,45 @@ Start the CLI with:
 ```
 uv run --extra cli python -m measure.measure
 ```
+
+Model ID and product name are entered in **Prepare**, not when starting a
+measurement. The app uses the selected Home Assistant entity name as the session
+label and prefills known device details in Prepare. For measurements without a
+controlled entity, you can supply an optional session name.
+
+CLI profile measurements without a `MODEL_ID` use a unique `export/session-<id>`
+directory, printed before the run starts and when it finishes. Existing `MODEL_ID` and `MODEL_NAME`
+environment settings remain supported; a supplied ID keeps `export/<model-id>`
+as the output directory. To resume a CLI measurement, set `MODEL_ID` to its export
+directory name. Interrupted light measurements print a command to return to the
+same directory; use the same device and settings and accept the resume prompt.
+Successful profile measurements print the next `powercalc-profile prepare` command.
+
+Prepare validates the metadata and creates a profile-library-shaped package in
+`<artifact-directory>/prepared` without changing the raw artifacts. Use the
+directory printed by the measurement command:
+
+```bash
+uv run powercalc-profile prepare export/<model-id>
+```
+
+For automation, put the same answers in a JSON file and disable prompts:
+
+```bash
+uv run powercalc-profile prepare export/<model-id> \
+  --metadata profile-metadata.json \
+  --non-interactive
+```
+
+The JSON keys are `manufacturer`, `model_id`, `product_name`, `aliases`,
+`gtins`, `product_url`, `mains_voltage`,
+`device_specs`, `measure_device`, `measure_device_firmware`,
+`measure_description`, and `author` (`name`, `github`, and optional `email`). Use
+`--library-root` when running outside a repository checkout. The manufacturer
+directory is resolved from the existing library or derived from the manufacturer;
+it is not a user-supplied field. `mains_voltage` must be either `120` or `230`
+when the measurement did not record a voltage range; otherwise it is derived from
+that range.
 
 ### Visualize measurement output
 
@@ -53,6 +96,18 @@ uv run --group visualize powercalc-visualize ../../profile_library --force
 
 ## Developing the Home Assistant app locally
 
+The app prefills profile connectivity from reliable Home Assistant device metadata:
+ZHA, Zigbee2MQTT, supported Hue devices, and deCONZ use Zigbee; Z-Wave JS uses Z-Wave.
+Groups and multiple measured entities must all resolve to the same connectivity.
+Unknown or conflicting metadata leaves the field unset. Existing profile values are
+preserved, and you can change or clear the default before validating the profile.
+The initial standby suggestion uses this default.
+
+Detection lives in `measure/home_assistant/connectivity.py`. To support another
+integration, add an integration mapping or a metadata predicate to the rule registry,
+with tests using its actual Home Assistant registry metadata. Do not infer device
+connectivity from a bridge's transport or from generic MQTT/network MAC addresses.
+
 The Home Assistant app has a FastAPI backend (`measure/`) and a Lit frontend (`frontend/`). You can run both locally with hot-reloading of the UI.
 See the [measurement tool architecture](../../docs/source/contributing/measure/architecture.md) for the shared CLI/API request, assembly, execution, and result pipeline.
 
@@ -63,12 +118,15 @@ See the [measurement tool architecture](../../docs/source/contributing/measure/a
 **Terminal 1 — backend** (from `utils/measure`):
 ```
 uv run --extra app python -m measure.ha_app.main \
+  --allow-local-access \
   --host 127.0.0.1 --port 8099 \
   --data-root .dev-data \
   --hass-url ws://127.0.0.1:8123/api/websocket \
   --hass-token <LONG_LIVED_TOKEN>
 ```
 Use the full Home Assistant WebSocket endpoint: `ws://<host>:8123/api/websocket` for a direct connection, or `ws://supervisor/core/websocket` from a Home Assistant add-on. `--hass-token` may be omitted if `SUPERVISOR_TOKEN` is exported instead. Session state and settings are written to `--data-root` (here `.dev-data`).
+
+The backend binds to `127.0.0.1` by default and requires Home Assistant ingress access. `--allow-local-access` explicitly enables unauthenticated local development: the bind address and incoming clients must both be loopback IP addresses. Setting `MEASURE_TRUSTED_INGRESS_ONLY=false` selects the same local access policy. `--hass-token` authenticates outgoing Home Assistant requests; it does not authenticate incoming API requests. The Home Assistant app keeps ingress protection enabled and listens on the container interface through its Docker command.
 
 GitHub device login requires a GitHub OAuth App with Device Flow enabled. Set its public client ID in `POWERCALC_GITHUB_CLIENT_ID` before starting the backend. Device login requests `public_repo` and `workflow`; the latter is needed to base a clean contribution branch on an upstream commit when the user's fork has stale workflow files. Without a client ID, the UI disables device login and retains the personal-access-token fallback.
 
@@ -81,7 +139,7 @@ npm run dev
 ```
 Open http://localhost:5173. The Vite dev server proxies `/api` (including the SSE event stream) to the backend on port 8099, mirroring the single-origin ingress deployment.
 
-To run the app the way it ships (single origin, no hot-reload), build the frontend with `npm run build` and start the backend with `create_app(..., static_root=Path("frontend/dist"))`; the UI is then served by FastAPI on port 8099.
+To run the app locally with a single origin and no hot-reload, build the frontend with `npm run build` and start the backend with `create_app(..., static_root=Path("frontend/dist"), trusted_ingress_only=False)` on `127.0.0.1:8099`, with Uvicorn proxy headers disabled. The UI is then served by FastAPI on port 8099, and requests must come from loopback.
 
 ### Checks
 

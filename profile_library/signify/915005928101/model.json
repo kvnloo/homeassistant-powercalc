@@ -3,7 +3,7 @@
     "5061030P7",
     "5061030P7_01"
   ],
-  "ean": [
+  "gtin": [
     "8718696175989"
   ],
   "calculation_strategy": "lut",
@@ -32,6 +32,7 @@
   },
   "name": "Hue Centris 2-Spot Ceiling Light LED Panel",
   "standby_power": 0.4,
+  "standby_power_estimated": true,
   "authors": [
     {
       "name": "Emil Blixt Hansen",

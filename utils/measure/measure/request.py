@@ -13,14 +13,22 @@ from measure.controller.light.const import LutMode
 from measure.controller.light.spec import LightControllerSpec
 from measure.controller.media.spec import MediaControllerSpec
 from measure.controller.spec import BaseControllerSpec
+from measure.controller.switch.spec import SwitchControllerSpec
 from measure.powermeter.spec import DummyPowerMeterSpec, ManualPowerMeterSpec, PowerMeterSpec
-from measure.runner.const import DEFAULT_EXPORT_FILENAME
+from measure.profile.device_type import PROFILE_DEVICE_DOMAINS, ProfileDeviceType
+from measure.recording.files import COMPLEX_PROFILE_EXPORT_FILENAME, DEFAULT_EXPORT_FILENAME
+from measure.recording.models import RecorderProfileRecipe as RecorderProfileRecipe
 from measure.tuning import MeasurementParameters
 
 
 class ResumePolicy(StrEnum):
     NEW = "new"
     RESUME = "resume"
+
+
+class RecorderPurpose(StrEnum):
+    PLAYBOOK = "playbook"
+    COMPLEX_PROFILE = "complex_profile"
 
 
 class DummyLoadCalibrationRequest(BaseModel):
@@ -103,8 +111,9 @@ class BaseMeasurementRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     measure_type: MeasureType
-    model_id: str = Field(default="measurement", min_length=1, max_length=120)
-    product_name: str = Field(default="Measurement", min_length=1, max_length=200)
+    model_id: str = Field(default="", max_length=120)
+    product_name: str = Field(default="", max_length=200)
+    session_name: str = Field(default="", max_length=200)
     measure_device: str = Field(default="", max_length=200)
     power_meter: PowerMeterSpec
     parameters: MeasurementParameters = Field(default_factory=MeasurementParameters)
@@ -120,11 +129,13 @@ class BaseMeasurementRequest(BaseModel):
     @classmethod
     def validate_model_id(cls, value: str) -> str:
         value = value.strip()
+        if not value:
+            return value
         if value in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()+-]*", value):
             raise ValueError("model_id contains unsafe characters")
         return value
 
-    @field_validator("product_name", "measure_device", mode="before")
+    @field_validator("product_name", "measure_device", "session_name", mode="before")
     @classmethod
     def normalize_profile_metadata(cls, value: str) -> str:
         return value.strip()
@@ -142,10 +153,10 @@ class BaseMeasurementRequest(BaseModel):
         return self
 
     @property
-    def controlled_entity_ids(self) -> tuple[str, ...]:
+    def controlled_entity_ids(self) -> list[str]:
         """Home Assistant entities driven during the measurement, empty when the controller drives none."""
         entity_ids = getattr(self.controller, "entity_ids", None) or [getattr(self.controller, "entity_id", None)]
-        return tuple(str(entity_id) for entity_id in entity_ids if entity_id)
+        return [str(entity_id) for entity_id in entity_ids if entity_id]
 
     @property
     def model_name(self) -> str:
@@ -158,8 +169,6 @@ class BaseMeasurementRequest(BaseModel):
 
 class LightMeasurementRequest(BaseMeasurementRequest):
     measure_type: Literal[MeasureType.LIGHT] = MeasureType.LIGHT
-    model_id: str = Field(min_length=1, max_length=120)
-    product_name: str = Field(min_length=1, max_length=200)
     measure_device: str = Field(min_length=1, max_length=200)
     controller: LightControllerSpec
     modes: set[LutMode] = Field(default_factory=lambda: {LutMode.BRIGHTNESS}, min_length=1)
@@ -199,12 +208,143 @@ class AverageMeasurementRequest(BaseMeasurementRequest):
 class RecorderMeasurementRequest(BaseMeasurementRequest):
     measure_type: Literal[MeasureType.RECORDER] = MeasureType.RECORDER
     controller: None = None
+    recorder_purpose: RecorderPurpose = RecorderPurpose.PLAYBOOK
+    profile_recipe: RecorderProfileRecipe | None = None
+    primary_entity_id: str | None = None
+    profile_device_type: ProfileDeviceType | None = None
+    tracked_entity_ids: tuple[str, ...] = Field(default=(), max_length=100)
+    vacuum_entity_id: str | None = None
+    battery_entity_id: str | None = None
+    additional_entity_ids: tuple[str, ...] = Field(default=(), max_length=100)
     export_filename: str = Field(default=DEFAULT_EXPORT_FILENAME, min_length=1, max_length=200)
 
-    @field_validator("export_filename")
+    @property
+    def generate_model_json(self) -> bool:
+        """Recorder model generation is handled by the analyser after capture."""
+
+        return False
+
+    @model_validator(mode="before")
     @classmethod
-    def validate_export_filename(cls, value: str) -> str:
-        return validate_export_filename(value)
+    def select_export_filename(cls, data: object) -> object:
+        """Use the fixed filename for the selected recorder output format."""
+
+        if not isinstance(data, dict):
+            return data
+        # Older generic requests used the first tracked entity as their primary.
+        if data.get("profile_recipe") == RecorderProfileRecipe.GENERIC and "primary_entity_id" not in data:
+            tracked = data.get("tracked_entity_ids")
+            if isinstance(tracked, list | tuple) and tracked:
+                data = data | {"primary_entity_id": tracked[0], "tracked_entity_ids": tracked[1:]}
+        filename = (
+            COMPLEX_PROFILE_EXPORT_FILENAME
+            if data.get("recorder_purpose") == RecorderPurpose.COMPLEX_PROFILE
+            else DEFAULT_EXPORT_FILENAME
+        )
+        return data | {"export_filename": filename}
+
+    @field_validator(
+        "tracked_entity_ids",
+        "additional_entity_ids",
+        mode="after",
+    )
+    @classmethod
+    def validate_entity_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            _validate_entity_id(value)
+        return values
+
+    @field_validator("primary_entity_id", "vacuum_entity_id", "battery_entity_id", mode="after")
+    @classmethod
+    def validate_optional_entity_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validate_entity_id(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_recorder_selection(self) -> RecorderMeasurementRequest:
+        if self.recorder_purpose == RecorderPurpose.PLAYBOOK:
+            if self._has_profile_selection():
+                raise ValueError("Playbook recordings cannot include complex-profile entity selections")
+            return self
+
+        if self.profile_recipe is None:
+            raise ValueError("profile_recipe is required for a complex-profile recording")
+        if self.profile_recipe == RecorderProfileRecipe.GENERIC:
+            self._validate_generic_selection()
+        else:
+            self._validate_vacuum_selection()
+
+        entity_ids = self.recorded_entity_ids
+        if len(entity_ids) > 100:
+            raise ValueError("A recorder session can track at most 100 entities")
+        if len(set(entity_ids)) != len(entity_ids):
+            raise ValueError("Recorder entity selections must be unique")
+        return self
+
+    def _has_profile_selection(self) -> bool:
+        return bool(
+            self.profile_recipe
+            or self.primary_entity_id
+            or self.profile_device_type
+            or self.tracked_entity_ids
+            or self.vacuum_entity_id
+            or self.battery_entity_id
+            or self.additional_entity_ids
+        )
+
+    def _validate_generic_selection(self) -> None:
+        if self.primary_entity_id is None:
+            raise ValueError("Select a primary entity for a generic complex-profile recording")
+        if self.profile_device_type == ProfileDeviceType.VACUUM_ROBOT:
+            raise ValueError("Use the robot vacuum recorder recipe for vacuum_robot profiles")
+        if self.profile_device_type is not None:
+            primary_domain = self.primary_entity_id.partition(".")[0]
+            if primary_domain not in PROFILE_DEVICE_DOMAINS[self.profile_device_type]:
+                raise ValueError(
+                    f"A {self.profile_device_type} profile requires a primary entity from "
+                    f"{', '.join(PROFILE_DEVICE_DOMAINS[self.profile_device_type])}"
+                )
+        if self.vacuum_entity_id or self.battery_entity_id or self.additional_entity_ids:
+            raise ValueError("Generic recordings cannot include vacuum-recipe entity selections")
+
+    def _validate_vacuum_selection(self) -> None:
+        if self.tracked_entity_ids or self.primary_entity_id or self.profile_device_type:
+            raise ValueError("Vacuum recordings cannot include generic tracked entities")
+        if self.vacuum_entity_id is None or self.battery_entity_id is None:
+            raise ValueError("A vacuum and battery entity are required for a vacuum recording")
+        if not self.vacuum_entity_id.startswith("vacuum."):
+            raise ValueError("vacuum_entity_id must be a vacuum entity")
+        if not self.battery_entity_id.startswith("sensor."):
+            raise ValueError("battery_entity_id must be a sensor entity")
+
+    @property
+    def recorded_entity_ids(self) -> list[str]:
+        """Entities recorded in deterministic capture order."""
+
+        if self.recorder_purpose == RecorderPurpose.PLAYBOOK:
+            return []
+        if self.profile_recipe == RecorderProfileRecipe.GENERIC:
+            assert self.primary_entity_id is not None
+            return [self.primary_entity_id, *self.tracked_entity_ids]
+        return [
+            entity_id
+            for entity_id in (self.vacuum_entity_id, self.battery_entity_id, *self.additional_entity_ids)
+            if entity_id is not None
+        ]
+
+    @property
+    def required_entity_ids(self) -> list[str]:
+        """Recorded entities a sample cannot be written without.
+
+        A vacuum recipe only needs the vacuum and its battery; manually selected additional
+        entities are best effort and may disappear mid-session.
+        """
+
+        entity_ids = self.recorded_entity_ids
+        if self.profile_recipe == RecorderProfileRecipe.VACUUM_ROBOT:
+            return entity_ids[:2]
+        return entity_ids
 
 
 class SpeakerMeasurementRequest(BaseMeasurementRequest):
@@ -227,6 +367,24 @@ class FanMeasurementRequest(BaseMeasurementRequest):
     generate_model: bool = True
 
 
+class SmartSwitchMeasurementRequest(BaseMeasurementRequest):
+    """Measure relay self consumption with every output load disconnected."""
+
+    measure_type: Literal[MeasureType.SMART_SWITCH] = MeasureType.SMART_SWITCH
+    controller: SwitchControllerSpec
+    power_monitoring: bool
+    samples_per_state: int = Field(default=12, ge=5, le=100)
+    repeat_cycles: int = Field(default=3, ge=2, le=5)
+    settle_seconds: float = Field(default=5, ge=0, le=120)
+    generate_model: bool = True
+
+    @model_validator(mode="after")
+    def validate_switch_meter(self) -> SmartSwitchMeasurementRequest:
+        if isinstance(self.power_meter, ManualPowerMeterSpec):
+            raise ValueError("Smart switch measurements require an automatic precise power meter")
+        return self
+
+
 type MeasurementRequest = (
     LightMeasurementRequest
     | AverageMeasurementRequest
@@ -234,6 +392,7 @@ type MeasurementRequest = (
     | SpeakerMeasurementRequest
     | ChargingMeasurementRequest
     | FanMeasurementRequest
+    | SmartSwitchMeasurementRequest
 )
 
 MeasurementRequestPayload = Annotated[MeasurementRequest, Field(discriminator="measure_type")]
@@ -253,3 +412,8 @@ def validate_export_filename(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()+-]*", value):
         raise ValueError("export_filename contains unsafe characters")
     return value
+
+
+def _validate_entity_id(value: str) -> None:
+    if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", value):
+        raise ValueError(f"Invalid Home Assistant entity ID: {value}")

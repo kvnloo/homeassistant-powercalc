@@ -1,5 +1,9 @@
 from decimal import Decimal
+from functools import partial
+import gzip
 import logging
+from pathlib import Path
+from unittest.mock import patch
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -19,7 +23,10 @@ from custom_components.powercalc.common import SourceEntity
 from custom_components.powercalc.const import CONF_MANUFACTURER, CONF_MODEL, CalculationStrategy
 from custom_components.powercalc.errors import StrategyConfigurationError
 from custom_components.powercalc.power_profile.library import ModelInfo, ProfileLibrary
+from custom_components.powercalc.power_profile.power_profile import PowerProfile
+from custom_components.powercalc.strategy import profile_data
 from custom_components.powercalc.strategy.factory import PowerCalculatorStrategyFactory
+from custom_components.powercalc.strategy.lut import LookupMode, LutRegistry, LutStrategy
 from custom_components.powercalc.strategy.strategy_interface import (
     PowerCalculationStrategyInterface,
 )
@@ -59,6 +66,50 @@ async def test_color_temp_lut(hass: HomeAssistant) -> None:
         strategy,
         state=_create_light_color_temp_state(brightness=300, color_temp=400),
         expected_power=7.4,
+    )
+
+
+@pytest.mark.parametrize("sub_profiles", [("nightlight", "default"), ("default", "nightlight")])
+async def test_supported_modes_are_cached_per_sub_profile(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    sub_profiles: tuple[str, str],
+) -> None:
+    """Sibling profiles with different LUT modes must work in either initialization order."""
+    profile_data = {
+        "default": (LookupMode.COLOR_TEMP, "brightness,color_temp,power\n100,300,3.2\n"),
+        "nightlight": (LookupMode.BRIGHTNESS, "brightness,power\n100,1.5\n"),
+    }
+    registry = LutRegistry(hass)
+    strategies = {}
+    for sub_profile in sub_profiles:
+        mode, csv_data = profile_data[sub_profile]
+        directory = tmp_path / sub_profile
+        directory.mkdir()
+        (directory / f"{mode}.csv").write_text(csv_data)
+        profile = PowerProfile(
+            hass,
+            "test",
+            "light_with_nightlight",
+            str(tmp_path),
+            {},
+            sub_profiles=[(name, {}) for name in sub_profiles],
+        )
+        await profile.select_sub_profile(sub_profile)
+        strategy = LutStrategy(create_source_entity(LIGHT_DOMAIN), registry, profile)
+        await strategy.initialize()
+        assert await registry.get_supported_modes(profile) == {mode}
+        strategies[sub_profile] = strategy
+
+    await _calculate_and_assert_power(
+        strategies["default"],
+        state=_create_light_color_temp_state(100, 300),
+        expected_power=3.2,
+    )
+    await _calculate_and_assert_power(
+        strategies["nightlight"],
+        state=_create_light_brightness_state(100),
+        expected_power=1.5,
     )
 
 
@@ -231,6 +282,8 @@ async def test_effect_not_found_logs_warning(hass: HomeAssistant, caplog: pytest
         "Off",
         "White",
         "None",
+        "Default",
+        "Mode Color",
     ],
 )
 async def test_lut_effect_is_ignored(
@@ -483,6 +536,44 @@ async def test_fallback_to_non_gzipped_file(hass: HomeAssistant) -> None:
         state=_create_light_color_temp_state(1, 153),
         expected_power=0.96,
     )
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("mode", list(LookupMode))
+async def test_oversized_lut_is_rejected(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    compressed: bool,
+    mode: LookupMode,
+) -> None:
+    path = tmp_path / f"{mode}.csv{'.gz' if compressed else ''}"
+    rows = {
+        LookupMode.BRIGHTNESS: b"brightness,power\n1,2\n",
+        LookupMode.COLOR_TEMP: b"brightness,color_temp,power\n1,153,2\n",
+        LookupMode.HS: b"brightness,hue,saturation,power\n1,0,0,2\n",
+        LookupMode.EFFECT: b"effect,brightness,power\nrainbow,1,2\n",
+    }
+    valid_data = rows[mode]
+    oversized_data = valid_data + valid_data.splitlines(keepends=True)[1] * 100
+    path.write_bytes(gzip.compress(oversized_data) if compressed else oversized_data)
+    profile = PowerProfile(hass, "test", "test", str(tmp_path), {})
+    registry = LutRegistry(hass)
+    load_entry = (
+        partial(registry.get_effect_entry, profile)
+        if mode == LookupMode.EFFECT
+        else partial(registry.get_lookup_entry, profile, mode)
+    )
+
+    with patch.object(profile_data, "MAX_UNCOMPRESSED_SIZE", 64):
+        with pytest.raises(StrategyConfigurationError, match="uncompressed size limit"):
+            await load_entry()
+
+        # Failed loads must not cache partial data or prevent a corrected file from loading.
+        path.write_bytes(gzip.compress(valid_data) if compressed else valid_data)
+        if mode == LookupMode.EFFECT:
+            assert (await registry.get_effect_entry(profile)).table == {"rainbow": {1: 2.0}}
+        else:
+            assert (await registry.get_lookup_entry(profile, mode)).sorted_keys == [1]
 
 
 async def _create_lut_strategy(

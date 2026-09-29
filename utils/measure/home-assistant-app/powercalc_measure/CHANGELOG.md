@@ -2,6 +2,88 @@
 
 ## Unreleased
 
+## 0.10.0 - 2026-09-27
+
+- #4881 Centralize vacuum entity rules and expand integration mappings @bramstroker
+
+### 🚀 Features
+
+- #4880 Automatically select vacuum recording entities @bramstroker
+- #4882 Support portable Valetudo dock entity references @bramstroker
+
+## 0.9.0 - 2026-09-26
+
+- #4875 Improve analyser validation and simplify domain models @bramstroker
+
+### 🚀 Features
+
+- #4867 Add developer setting to accept 0 W readings @bramstroker
+- #4874 Analyse vacuum dock activities in the measure recorder @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4860 Call media_player.volume_mute for the muted speaker baseline @LaurensBot
+
+## 0.8.0 - 2026-09-26
+
+### 🚀 Features
+
+- #4826 Autofill device connectivity in PowerCalc Measure @bramstroker
+- #4827 Allow changing the setup when remeasuring standby @bramstroker
+- #4839 Exclude transient effect commands from Measure recordings @bramstroker
+- #4858 Store profile LUTs as plain CSV and compress on installation @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4818 Clarify measurement description and setup guidance @bramstroker
+- #4824 Warn when standby estimate metadata changes @bramstroker
+- #4828 Make standby calibration recoverable and tighten setup validation @bramstroker
+- #4850 Clarify vacuum measurement results and profile preparation @bramstroker
+
+## 0.7.1 - 2026-09-20
+
+- #4751 Tapo smart support @TheLexus
+- #4760 Rename profile EAN field to GTIN @bramstroker
+- #4790 Improve vacuum recording entity capture @bramstroker
+- #4796 Simplify measurement package layout and app routes @bramstroker
+- #4801 Extend measurement backend behavior coverage @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4780 Wait for Home Assistant entities after restart @bramstroker
+- #4781 Retry transient Shelly rate limits @bramstroker
+- #4806 Recover unavailable light standby measurements @bramstroker
+- #4813 Keep standby failures from discarding a finished session @bramstroker
+
+## 0.7.0 - 2026-09-13
+
+- #4724 Clean up measure frontend components @bramstroker
+- #4725 Rename Use profile step to Submit profile @bramstroker
+- #4726 Use repeatable inputs for profile aliases and barcodes @bramstroker
+- #4729 Improve measurement setup, recovery, and profile preparation @bramstroker
+- #4736 Restrict standalone measurement API access @bramstroker
+- #4741 Retry the initial turn-on in set_light_to_maximum_brightness @philscottydev
+
+### 🚀 Features
+
+- #4668 Add recorder profile analyser @bramstroker
+- #4711 Explain grouping for larger light measurements @bramstroker
+- #4721 Improve measurement setup and profile preparation @bramstroker
+- #4727 Add light mode and refine measurement session cards @bramstroker
+- #4730 Add controlled entity to the Measure session status sensor @bramstroker
+
+### 🐛 Bug Fixes
+
+- #4702 Clarify repeat measurement action @bramstroker
+- #4710 Improve light discovery guidance and preflight stabilization @bramstroker
+- #4728 Preserve progress across resumed measurements @bramstroker
+
+## 0.6.0 - 2026-09-02
+
+### 🚀 Features
+
+- #4667 Add entity state capture to recorder. 1st prep for complex profile creation @bramstroker
+
 ## 0.5.0 - 2026-08-29
 
 - #4556 Add support for the OWON OWH98xx series power meters @MartinJM

@@ -3,6 +3,7 @@ name: Generate plots
 on:
   push:
     paths:
+      - 'profile_library/**/*.csv'
       - 'profile_library/**/*.csv.gz'
       - 'profile_library/**/model.json'
     branches:
@@ -27,9 +28,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: '0.12.7'
+          version: '0.12.19'
           working-directory: './utils/measure'
           enable-cache: true
           cache-dependency-glob: |

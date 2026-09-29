@@ -1,0 +1,549 @@
+import { LitElement, css, html, nothing, type PropertyValues } from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import type {
+  Capabilities,
+  DummyLoadCalibration,
+  DummyLoadSpec,
+  EntityDescriptor,
+  ErrorHelp,
+  MeasureDefinition,
+  MeasureParameterName,
+  MeasureType,
+  MeasurementRequest,
+  PowerMeterSpec,
+} from "../../types";
+import { hasVoltageReading, meterFor } from "../../power-meter/registry";
+import { entityDomains } from "../../measurement/definition";
+import type { MeterContext } from "../../power-meter/registry";
+import { emit } from "../../utils/events";
+import { submittedForm } from "../../utils/form";
+import { sharedStyles } from "../../styles";
+import { defaultDummyLoadMode, dummyLoadStyles, renderDummyLoad } from "./dummy-load-field";
+import {
+  renderPowerMeterRequired,
+  renderPowerMeterSummary,
+  renderDevicePicker,
+  renderRoutePicker,
+  renderSelectionChip,
+  setupChromeStyles,
+} from "./chrome";
+import {
+  deviceChoices,
+  FREE_MEASUREMENT,
+  routesForDevice,
+  selectionFromRequest,
+  selectionFromType,
+  type MeasurementRoute,
+} from "./device-routes";
+import { errorHelpLink } from "../shared/error-help-link";
+import type {
+  EntityDeviceChange,
+  EntitySelectionChange,
+  MultiSelectionChange,
+  MultipleLightsChange,
+  SelectValueChange,
+} from "./fields-section";
+import type { ParameterChange } from "./tuning-section";
+import { prepareRequest } from "./request";
+import { entityRows } from "./options";
+import "./developer-options";
+import "./fields-section";
+
+@customElement("measure-setup-view")
+export class SetupView extends LitElement {
+  @property({ attribute: false })
+  capabilities?: Capabilities;
+
+  @property({ attribute: false })
+  definitions: MeasureDefinition[] = [];
+
+  @property({ attribute: false })
+  lights: EntityDescriptor[] = [];
+
+  @property({ attribute: false })
+  powers: EntityDescriptor[] = [];
+
+  @property({ attribute: false })
+  voltages: EntityDescriptor[] = [];
+
+  @property({ attribute: false })
+  deviceEntities: Record<string, EntityDescriptor[]> = {};
+
+  @property({ attribute: false })
+  deviceEntityErrors: Record<string, string> = {};
+
+  @property({ attribute: false })
+  initialRequest?: MeasurementRequest;
+
+  @property({ attribute: false })
+  dummyLoadCalibration: DummyLoadCalibration | null = null;
+
+  @property({ attribute: false })
+  initialType?: MeasureType;
+
+  /** How the power meter this measurement uses is addressed. */
+
+  @property({ attribute: false })
+  meter: PowerMeterSpec = { type: "hass", entity_id: "" };
+
+  @property({ type: String })
+  defaultMeasureDevice = "";
+
+  @property({ type: Boolean })
+  powerMeterConfigured = true;
+
+  @property({ type: Boolean })
+  busy = false;
+
+  @property({ type: String })
+  errorMessage = "";
+
+  @property({ attribute: false })
+  errorHelp?: ErrorHelp;
+
+  @state()
+  selectedType?: MeasureType;
+
+  @state()
+  selectedDeviceId?: string;
+
+  @state()
+  selectedRouteId?: string;
+
+  @state()
+  deviceSearch = "";
+
+  /** Entities picked per field. A single-entity field simply holds a one-entry list. */
+
+  @state()
+  selectedEntities: Record<string, string[]> = {};
+
+  @state()
+  selectedEntityDeviceIds: Record<string, string> = {};
+
+  @state()
+  selectValues: Record<string, string> = {};
+
+  @state()
+  multiSelection: Record<string, string[]> = {};
+
+  @state()
+  parameterValues: Partial<Record<MeasureParameterName, string>> = {};
+
+  @state()
+  dummyLoadEnabled = false;
+
+  @state()
+  dummyLoadMode: DummyLoadSpec["mode"] = "calibrate";
+
+  @state()
+  dummyController = false;
+
+  @state()
+  multipleLights = false;
+
+  /** Deliberately not reactive: it exists so a typed count survives re-renders instead of being recomputed. */
+  private derivedCountOverride?: string;
+
+  static readonly styles = [sharedStyles, dummyLoadStyles, setupChromeStyles, css`
+    :host { display: block; min-width: 0; max-width: 100%; }
+    measure-setup-fields-section, measure-setup-developer-options { display: contents; }
+    form { display: grid; gap: 1rem; }
+    .profile-grid { align-items: start; }
+    .device-section { display: grid; gap: 1rem; min-width: 0; }
+    .light-grid > measure-combobox, .light-grid > .field-block { grid-column: 1 / -1; }
+    .checks { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+    .check { min-height: 42px; padding: 0 0.75rem; border: 1px solid var(--line); border-radius: 999px; }
+    /* A checkbox pill has no caption above it, so pin it to the input line of its row. */
+    .profile-grid > .check { align-self: end; }
+    details { border-top: 1px solid var(--line); padding-top: 1rem; }
+    summary { width: fit-content; color: var(--signal-strong); cursor: pointer; font-weight: 700; }
+    details .grid { margin-top: 1rem; }
+    .field-with-help { position: relative; min-width: 0; }
+    details.context-help { border: 0; padding: 0; }
+    .context-help > summary {
+      position: absolute; top: 0; right: 0; display: grid; place-items: center;
+      width: 24px; height: 24px; padding: 0; list-style: none;
+    }
+    .context-help > summary::-webkit-details-marker { display: none; }
+    .context-help svg { width: 18px; height: 18px; }
+    .help-content {
+      position: absolute; top: 1.9rem; right: 0; z-index: 25; width: min(28rem, 100%);
+      box-sizing: border-box; padding: 0.85rem 1rem; border: 1px solid var(--line); border-radius: 10px;
+      background: var(--surface-raised); box-shadow: 0 10px 28px rgb(0 0 0 / 35%);
+      color: var(--ink); font-size: 0.82rem; line-height: 1.5;
+    }
+    .help-content p { margin: 0; }
+    .help-content p + p { margin-top: 0.65rem; }
+    .developer-content { display: grid; gap: 0.75rem; margin-top: 0.75rem; }
+    .developer-content .notice { margin: 0; }
+    .test-mode-status { margin: 0; color: var(--signal-strong); font-size: 0.82rem; }
+    .advanced-heading { grid-column: 1 / -1; margin: 0.25rem 0 -0.25rem; color: var(--signal-strong); font-size: 0.76rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+    .context p { margin-bottom: 0; }
+
+    /* A checkbox that reveals or hides a block of the form, rather than submitting a value. */
+    .toggle-pill { width: fit-content; }
+    .dummy-controller { display: grid; gap: 0.4rem; }
+    .dummy-controller p { margin: 0; }
+    .multiple-lights { padding-right: 2rem; }
+    .multiple-lights .toggle-pill { min-height: 28px; padding: 0; border: 0; border-radius: 0; }
+    .field-block { display: grid; gap: 0.45rem; }
+    .field-block .field-hint, .select-guidance p { margin: 0; }
+    .select-guidance { display: grid; gap: 0.35rem; }
+    .select-guidance ul { margin: 0.1rem 0 0; padding-left: 1.2rem; color: var(--muted); font-size: 0.82rem; }
+
+    @media (max-width: 640px) {
+      .context { display: block; }
+    }
+  `];
+
+  willUpdate(changed: PropertyValues<this>): void {
+    // Restore a saved route without changing the request's stable measure_type.
+    if ((changed.has("initialType") || changed.has("initialRequest")) && this.selectedType === undefined) {
+      const restored = this.initialRequest ? selectionFromRequest(this.initialRequest) : this.initialType
+        ? selectionFromType(this.initialType) : undefined;
+      if (restored) {
+        this.selectedDeviceId = restored.deviceId;
+        this.selectedRouteId = restored.routeId;
+        this.selectedType = this.initialRequest?.measure_type ?? this.initialType;
+      }
+    }
+    if (changed.has("initialRequest")) {
+      const controller = this.initialRequest && "controller" in this.initialRequest
+        ? this.initialRequest.controller
+        : undefined;
+      this.dummyLoadEnabled = Boolean(this.initialRequest?.dummy_load);
+      this.dummyLoadMode = this.initialRequest?.dummy_load?.mode ?? defaultDummyLoadMode(this.dummyLoadCalibration);
+      this.dummyController = controller?.type === "dummy";
+      this.multipleLights = Boolean(
+        this.initialRequest?.measure_type === "light"
+        && (this.initialRequest.controller.type === "hass_multi" || this.initialRequest.multiple_light_count > 1),
+      );
+    } else if (changed.has("dummyLoadCalibration") && !this.dummyLoadEnabled) {
+      this.dummyLoadMode = defaultDummyLoadMode(this.dummyLoadCalibration);
+    }
+  }
+
+  protected async getUpdateComplete(): Promise<boolean> {
+    const complete = await super.getUpdateComplete();
+    const sections = this.shadowRoot?.querySelectorAll<LitElement>(
+      "measure-setup-fields-section, measure-setup-developer-options",
+    ) ?? [];
+    await Promise.all(Array.from(sections, (section) => section.updateComplete));
+    return complete;
+  }
+
+  render() {
+    return html`
+      <section class="panel" aria-labelledby="setup-title">
+        <div class="context">
+          <div>
+            <p class="eyebrow">01 / Setup</p>
+            <h2 id="setup-title">Configure the measurement</h2>
+          </div>
+        </div>
+        ${this.initialRequest ? html`<p class="notice" role="status">
+          This draft uses the selected session's measurement device and power-meter configuration.
+          <button type="button" @click=${this.useCurrentSettings}>Use current app defaults</button>
+        </p>` : nothing}
+        ${this.powerMeterConfigured ? this.renderSetupContent() : renderPowerMeterRequired(this.openSettings)}
+      </section>
+    `;
+  }
+
+  private renderSetupContent() {
+    const devices = deviceChoices(this.definitions).filter((device) => routesForDevice(device.id, this.definitions).length);
+    const freeRoutes = routesForDevice(FREE_MEASUREMENT, this.definitions);
+    const selectedDevice = this.selectedDeviceId === FREE_MEASUREMENT
+      ? { id: FREE_MEASUREMENT, label: "Free measurement" }
+      : devices.find((device) => device.id === this.selectedDeviceId)
+        ?? (this.selectedDeviceId && this.currentRun
+          ? { id: this.selectedDeviceId, label: this.selectedDeviceId.replaceAll("_", " ") }
+          : undefined);
+    const routes = selectedDevice ? routesForDevice(selectedDevice.id, this.definitions) : [];
+    const selectedRoute = routes.find((route) => route.id === this.selectedRouteId) ?? this.restoredRoute();
+    // Older callers may still set selectedType directly without choosing a route.
+    const hasForm = Boolean(this.selectedType && (selectedRoute || !this.selectedDeviceId));
+    return html`
+      ${hasForm
+        ? html`<div class="setup-summary">
+            ${selectedDevice && selectedRoute ? renderSelectionChip(
+              selectedDevice, selectedRoute, this.changeDevice, this.changeRoute, routes.length > 1,
+            ) : nothing}
+            ${renderPowerMeterSummary({
+              meter: this.meter,
+              measureDevice: this.defaultMeasureDevice,
+              context: this.meterContext(),
+              onOpenSettings: this.openSettings,
+            })}
+          </div>`
+        : selectedDevice
+          ? renderRoutePicker(selectedDevice, routes, this.selectRoute, this.changeDevice)
+          : renderDevicePicker(devices, this.deviceSearch, this.searchDevices, this.selectDevice, freeRoutes.length > 0)}
+      ${hasForm && this.selectedType ? this.renderMeasurementForm(this.selectedType, selectedRoute) : nothing}
+    `;
+  }
+
+  private useCurrentSettings(): void {
+    emit(this, "use-current-settings");
+  }
+
+  private renderMeasurementForm(type: MeasureType, route?: MeasurementRoute) {
+    const definition = this.definition(type);
+    if (!definition || !this.capabilities) return html`<p class="muted">Loading measurement capabilities…</p>`;
+    const run = this.currentRun;
+    const activeLightCheck = type === "light" && !this.dummyController && !this.dummyLoadEnabled;
+    return html`
+      <form @submit=${this.submitMeasurement}>
+        <measure-setup-fields-section
+          .capabilities=${this.capabilities}
+          .definition=${definition}
+          .definitions=${this.definitions}
+          .request=${run}
+          .presetValues=${route?.preset ?? {}}
+          .lights=${this.lights}
+          .deviceEntities=${this.deviceEntities}
+          .deviceEntityErrors=${this.deviceEntityErrors}
+          .selectedEntities=${this.selectedEntities}
+          .selectedEntityDeviceIds=${this.selectedEntityDeviceIds}
+          .selectValues=${this.selectValues}
+          .multiSelection=${this.multiSelection}
+          .parameterValues=${this.parameterValues}
+          .dummyController=${this.dummyController}
+          .multipleLights=${this.multipleLights}
+          .derivedCountOverride=${this.derivedCountOverride}
+          @entity-selection-change=${this.entitySelectionChanged}
+          @entity-device-change=${this.entityDeviceChanged}
+          @select-value-change=${this.selectValueChanged}
+          @multi-selection-change=${this.multiSelectionChanged}
+          @multiple-lights-change=${this.multipleLightsChanged}
+          @derived-count-change=${this.derivedCountChanged}
+          @parameter-change=${this.parameterChanged}
+        ></measure-setup-fields-section>
+
+        ${this.renderDummyLoadSection(run?.dummy_load)}
+        <measure-setup-developer-options
+          .developerMode=${this.capabilities.developer_mode ?? false}
+          .fastTestMode=${this.capabilities.fast_test_mode ?? false}
+          .hasController=${definition.supports_dummy_controller !== false
+            && definition.fields.some((field) => field.role === "controller")}
+          .dummyController=${this.dummyController}
+          @dummy-controller-change=${this.dummyControllerChanged}
+        ></measure-setup-developer-options>
+
+        ${this.errorMessage ? html`<p class="notice error" role="alert">${this.errorMessage}${errorHelpLink(this.errorHelp)}</p>` : nothing}
+        ${activeLightCheck ? html`
+          <p class="muted">The setup check briefly controls the selected light at low-load settings and leaves it off.</p>
+        ` : nothing}
+        ${activeLightCheck && this.busy ? html`
+          <div class="notice" role="status" aria-live="polite">
+            <strong>Checking low-load light settings…</strong>
+            <p>Testing representative low-load points for the selected brightness, white-channel, and color modes. Each point uses the configured settle, sample, and retry settings.</p>
+            <progress aria-label="Low-load light check in progress"></progress>
+          </div>
+        ` : nothing}
+        <div class="actions"><button class="primary" type="submit" ?disabled=${this.busy}>${this.busy
+          ? activeLightCheck ? "Checking light and setup…" : "Checking setup…"
+          : activeLightCheck ? "Check light and setup" : "Check setup"}</button></div>
+      </form>
+    `;
+  }
+
+  private renderDummyLoadSection(stored?: DummyLoadSpec | null) {
+    if (!meterFor(this.meter.type).supportsDummyLoad) return nothing;
+    return renderDummyLoad({
+      calibration: this.dummyLoadCalibration,
+      stored,
+      enabled: this.dummyLoadEnabled,
+      mode: this.dummyLoadMode,
+      voltageAvailable: hasVoltageReading(this.meter),
+      onToggle: this.dummyLoadEnabledChanged,
+      onModeChange: this.dummyLoadModeChanged,
+    });
+  }
+
+  private dummyLoadEnabledChanged(event: Event): void {
+    this.dummyLoadEnabled = (event.currentTarget as HTMLInputElement).checked;
+    if (this.dummyLoadEnabled) this.dummyLoadMode = defaultDummyLoadMode(this.dummyLoadCalibration);
+  }
+
+  private dummyLoadModeChanged(event: Event): void {
+    const value = (event.currentTarget as HTMLInputElement).value;
+    if (value !== "calibrate" && value !== "reuse") throw new Error("The selected dummy-load mode is invalid.");
+    this.dummyLoadMode = value;
+  }
+
+  private parameterChanged(event: CustomEvent<ParameterChange>): void {
+    this.parameterValues = { ...this.parameterValues, [event.detail.name]: event.detail.value };
+  }
+
+  private dummyControllerChanged(event: CustomEvent<boolean>): void {
+    this.dummyController = event.detail;
+  }
+
+  private multipleLightsChanged(event: CustomEvent<MultipleLightsChange>): void {
+    this.multipleLights = event.detail.checked;
+    if (this.multipleLights) return;
+    // Back to one light: keep the first pick so the single selector stays populated, and let the count be derived again.
+    this.selectEntities(event.detail.fieldName, this.currentRows(event.detail.fieldName).filter(Boolean).slice(0, 1));
+    this.derivedCountOverride = undefined;
+  }
+
+  private entitySelectionChanged(event: CustomEvent<EntitySelectionChange>): void {
+    this.selectEntities(event.detail.name, event.detail.rows);
+  }
+
+  private entityDeviceChanged(event: CustomEvent<EntityDeviceChange>): void {
+    const { name, deviceId } = event.detail;
+    this.selectedEntityDeviceIds = { ...this.selectedEntityDeviceIds, [name]: deviceId };
+    this.selectEntities(name, []);
+  }
+
+  private selectValueChanged(event: CustomEvent<SelectValueChange>): void {
+    this.selectValues = { ...this.selectValues, [event.detail.name]: event.detail.value };
+    if (event.detail.name === "profile_device_type") {
+      this.selectEntities("primary_entity_id", []);
+      this.selectEntities("tracked_entity_ids", []);
+    }
+  }
+
+  private multiSelectionChanged(event: CustomEvent<MultiSelectionChange>): void {
+    this.multiSelection = { ...this.multiSelection, [event.detail.name]: event.detail.values };
+  }
+
+  private derivedCountChanged(event: CustomEvent<string>): void {
+    this.derivedCountOverride = event.detail;
+  }
+
+  private readonly searchDevices = (value: string): void => {
+    this.deviceSearch = value;
+  };
+
+  private readonly selectDevice = (deviceId: string): void => {
+    this.errorMessage = "";
+    this.selectedDeviceId = deviceId;
+    this.selectedRouteId = undefined;
+    this.selectedType = undefined;
+    this.clearRouteValues();
+    const routes = routesForDevice(deviceId, this.definitions);
+    if (routes.length === 1) this.selectRoute(routes[0]!.id);
+  };
+
+  private readonly selectRoute = (routeId: string): void => {
+    const route = routesForDevice(this.selectedDeviceId ?? "", this.definitions)
+      .find((candidate) => candidate.id === routeId);
+    if (!route) return;
+    this.errorMessage = "";
+    this.clearRouteValues();
+    this.selectedRouteId = routeId;
+    this.selectedType = route.measureType;
+    this.selectValues = { ...route.preset };
+    emit<MeasureType>(this, "measure-type-selected", route.measureType);
+    const definition = this.definition(route.measureType);
+    if (definition) {
+      const values = new FormData();
+      for (const [name, value] of Object.entries(route.preset)) values.set(name, value);
+      emit<string[]>(this, "entity-domains-requested", entityDomains(definition, values));
+    }
+  };
+
+  private clearRouteValues(): void {
+    this.dummyController = false;
+    this.multipleLights = false;
+    this.selectedEntities = {};
+    this.selectedEntityDeviceIds = {};
+    this.selectValues = {};
+    this.multiSelection = {};
+    this.parameterValues = {};
+    this.derivedCountOverride = undefined;
+  }
+
+  private readonly changeDevice = (): void => {
+    this.errorMessage = "";
+    this.selectedType = undefined;
+    this.selectedDeviceId = undefined;
+    this.selectedRouteId = undefined;
+    this.clearRouteValues();
+  };
+
+  private readonly changeRoute = (): void => {
+    this.errorMessage = "";
+    this.selectedType = undefined;
+    this.selectedRouteId = undefined;
+    this.clearRouteValues();
+  };
+  /** Rows as the form currently shows them, so an edit starts from what the user can see. */
+  private currentRows(name: string): string[] {
+    const field = this.selectedType
+      ? this.definition(this.selectedType)?.fields.find((candidate) => candidate.name === name)
+      : undefined;
+    return field ? entityRows(field, { selectedEntities: this.selectedEntities, request: this.currentRun }) : [];
+  }
+
+  /** The previous run, when it belongs to the type now being configured. */
+  private get currentRun(): MeasurementRequest | undefined {
+    const request = this.initialRequest;
+    if (!request || request.measure_type !== this.selectedType) return undefined;
+    if (!this.selectedRouteId) return request;
+    const selection = selectionFromRequest(request);
+    return selection.deviceId === this.selectedDeviceId && selection.routeId === this.selectedRouteId
+      ? request : undefined;
+  }
+
+  /** Keep old saved recordings editable even when their route is no longer offered for new sessions. */
+  private restoredRoute(): MeasurementRoute | undefined {
+    const request = this.currentRun;
+    if (!request || !this.selectedRouteId) return undefined;
+    if (request.measure_type !== "recorder" || request.recorder_purpose !== "complex_profile") return undefined;
+    const preset: Record<string, string> = request.profile_recipe === "vacuum_robot"
+      ? { recorder_purpose: "complex_profile", profile_recipe: "vacuum_robot" }
+      : {
+          recorder_purpose: "complex_profile", profile_recipe: "generic",
+          profile_device_type: request.profile_device_type ?? "generic_iot",
+        };
+    return {
+      id: this.selectedRouteId, measureType: "recorder", label: "Saved recording method",
+      description: "Previously saved complex-profile recording.", preset,
+    };
+  }
+
+  private selectEntities(name: string, rows: string[]): void {
+    this.selectedEntities = { ...this.selectedEntities, [name]: rows };
+  }
+
+  private readonly openSettings = (): void => {
+    emit(this, "open-settings");
+  };
+
+  private definition(type: MeasureType): MeasureDefinition | undefined {
+    return this.definitions.find((item) => item.measure_type === type);
+  }
+
+  private submitMeasurement(event: SubmitEvent): void {
+    event.preventDefault();
+    const definition = this.selectedType ? this.definition(this.selectedType) : undefined;
+    if (!definition || !this.capabilities) return;
+    const formElement = event.currentTarget as HTMLFormElement;
+    const result = prepareRequest({
+      definition,
+      form: submittedForm(formElement),
+      capabilities: this.capabilities,
+      meter: this.meter,
+      measureDevice: this.defaultMeasureDevice,
+      dummyController: this.dummyController,
+      calibration: this.dummyLoadCalibration,
+      initialRequest: this.currentRun,
+      entities: [...this.lights, ...Object.values(this.deviceEntities).flat()],
+      entityErrors: this.deviceEntityErrors,
+    });
+    if (result.error) {
+      this.errorMessage = result.error;
+      return;
+    }
+    emit<MeasurementRequest>(this, "preflight", result.request);
+  }
+
+  private meterContext(): MeterContext {
+    return { powers: this.powers, voltages: this.voltages };
+  }
+}

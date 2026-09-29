@@ -1,4 +1,5 @@
 import logging
+from unittest.mock import MagicMock
 
 from homeassistant import data_entry_flow
 from homeassistant.components.sensor import SensorDeviceClass
@@ -252,6 +253,12 @@ async def test_change_manufacturer_model_from_options_flow(hass: HomeAssistant) 
     )
 
     result = await initialize_options_flow(hass, entry, Step.LIBRARY_OPTIONS)
+
+    assert result["description_placeholders"] == {
+        "manufacturer": "ikea",
+        "model": "LED1545G12",
+        "profile_details": ("\n\n[View measurement details](https://library.powercalc.nl/profiles/ikea/led1545g12)"),
+    }
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
@@ -839,6 +846,14 @@ async def test_discovery_flow_documentation_url_in_remarks(hass: HomeAssistant) 
     assert "[Documentation](https://docs.powercalc.nl/cookbook/ups/)" in remarks
 
 
+def test_custom_profile_has_no_public_library_link() -> None:
+    """Custom profiles are not available in the public library."""
+    flow = MagicMock()
+    profile = MagicMock(is_custom_profile=True)
+
+    assert LibraryConfigFlow(flow)._build_profile_details(profile) == ""  # noqa: SLF001
+
+
 async def test_custom_fields_documentation_url_placeholder(
     hass: HomeAssistant,
 ) -> None:
@@ -894,6 +909,34 @@ async def test_options_flow_initializes_profile_with_custom_fields(
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["step_id"] == Step.LIBRARY_OPTIONS
+
+
+@pytest.mark.parametrize("saved_entity", [None, "sensor.manual"])
+async def test_custom_fields_prefill_preserves_saved_selection(hass: HomeAssistant, saved_entity: str | None) -> None:
+    device = mock_device(hass, "test-device", "test", "device_custom_fields")
+    mock_entities_in_registry(
+        hass,
+        {
+            "sensor.automatic": {"device_id": device.id, "translation_key": "dependency"},
+            "sensor.manual": {"device_id": device.id},
+        },
+    )
+    source = SourceEntity(DUMMY_ENTITY_ID, "Test device", "sensor", device_entry=device)
+    profile = await get_power_profile(
+        hass, {CONF_VARIABLES: {"some_entity": "sensor.automatic"}}, source, ModelInfo("test", "device_custom_fields")
+    )
+    profile.json_data["fields"]["some_entity"]["auto_select"] = {"translation_key": "dependency"}
+    flow = PowercalcConfigFlow()
+    flow.hass = hass
+    flow.source_entity = source
+    flow.selected_profile = profile
+    if saved_entity:
+        flow.sensor_config[CONF_VARIABLES] = {"some_entity": saved_entity}
+
+    result = await LibraryConfigFlow(flow).async_step_library_custom_fields()
+
+    assert result["step_id"] == Step.LIBRARY_CUSTOM_FIELDS
+    assert result["data_schema"]({}) == {"some_entity": saved_entity or "sensor.automatic"}
 
 
 async def test_availability_entity_step_skipped(hass: HomeAssistant) -> None:

@@ -15,7 +15,7 @@
       "bluetooth"
     ]
   },
-  "ean": [
+  "gtin": [
     "046677563233"
   ],
   "measure_description": "Measured with utils/measure script, standby measured with Kill-a-Watt",
@@ -29,6 +29,7 @@
   },
   "name": "Hue White Ambiance 1100 E26 Bluetooth",
   "standby_power": 0.25,
+  "standby_power_estimated": true,
   "authors": [
     {
       "name": "nanderson97651",

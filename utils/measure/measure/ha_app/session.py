@@ -1,11 +1,12 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from threading import Event, Lock
 from typing import Any, TypedDict, cast
 
-from measure.clock import utc_now
-from measure.execution import MeasurementCancelledError, OperatingPoint
+from measure.cancellation import MeasurementCancelledError
+from measure.runner.interaction import OperatingPoint
+from measure.utils.clock import utc_now
 
 
 class CalibrationSample(TypedDict):
@@ -59,6 +60,7 @@ class SessionEventType(StrEnum):
     SAMPLE = "sample"
     CALIBRATION_SAMPLE = "calibration_sample"
     OPERATING_POINT = "operating_point"
+    ENTITY_STATES = "entity_states"
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class SessionSnapshot:
     summary: dict[str, str] | None = None
     operating_point: OperatingPoint | None = None
     calibration_sample: CalibrationSample | None = None
+    entity_states: dict[str, str] = field(default_factory=dict)
 
     @property
     def progress(self) -> float:
@@ -211,3 +214,11 @@ class SessionControl:
 
     def operating_point(self, point: OperatingPoint) -> None:
         self.emit(SessionEventType.OPERATING_POINT, cast(dict[str, Any], dict(point)))
+
+    def entity_states(self, states: Mapping[str, str]) -> None:
+        """Emit the latest recorder entity states for live display."""
+        self.emit(SessionEventType.ENTITY_STATES, {"states": dict(states)})
+
+
+def is_active_session(snapshot: SessionSnapshot | None) -> bool:
+    return snapshot is not None and snapshot.state in ACTIVE_SESSION_STATES

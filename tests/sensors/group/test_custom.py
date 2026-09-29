@@ -24,6 +24,7 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
+    EntityCategory,
     UnitOfEnergy,
     UnitOfPower,
 )
@@ -51,6 +52,7 @@ from custom_components.powercalc.const import (
     CONF_CREATE_GROUP,
     CONF_CREATE_UTILITY_METERS,
     CONF_DISABLE_EXTENDED_ATTRIBUTES,
+    CONF_ENERGY_SENSOR_CATEGORY,
     CONF_ENERGY_SENSOR_ID,
     CONF_ENERGY_SENSOR_NAMING,
     CONF_ENERGY_SENSOR_UNIT_PREFIX,
@@ -71,6 +73,7 @@ from custom_components.powercalc.const import (
     CONF_INCLUDE_NON_POWERCALC_SENSORS,
     CONF_MODE,
     CONF_POWER,
+    CONF_POWER_SENSOR_CATEGORY,
     CONF_POWER_SENSOR_ID,
     CONF_SENSOR_TYPE,
     CONF_STANDBY_POWER,
@@ -295,6 +298,67 @@ async def test_subgroups_from_config_entry(hass: HomeAssistant) -> None:
             },
         },
     )
+
+
+async def test_circular_subgroups_are_resolved_once(hass: HomeAssistant) -> None:
+    """Two groups referencing each other as subgroup must not recurse endlessly."""
+    config_entry_group_a = await create_mock_group_entry(
+        hass,
+        "GroupA",
+        {
+            CONF_GROUP_POWER_ENTITIES: ["sensor.test1_power"],
+            CONF_GROUP_ENERGY_ENTITIES: ["sensor.test1_energy"],
+            CONF_IGNORE_UNAVAILABLE_STATE: True,
+        },
+    )
+    config_entry_group_b = await create_mock_group_entry(
+        hass,
+        "GroupB",
+        {
+            CONF_GROUP_POWER_ENTITIES: ["sensor.test2_power"],
+            CONF_GROUP_ENERGY_ENTITIES: ["sensor.test2_energy"],
+            CONF_SUB_GROUPS: [config_entry_group_a.entry_id],
+            CONF_IGNORE_UNAVAILABLE_STATE: True,
+        },
+    )
+    hass.config_entries.async_update_entry(
+        config_entry_group_a,
+        data={**config_entry_group_a.data, CONF_SUB_GROUPS: [config_entry_group_b.entry_id]},
+    )
+
+    resolved = await resolve_entity_ids_recursively(hass, config_entry_group_a, SensorDeviceClass.POWER)
+    assert resolved == {"sensor.test1_power", "sensor.test2_power"}
+
+    resolved = await resolve_entity_ids_recursively(hass, config_entry_group_a, SensorDeviceClass.ENERGY)
+    assert resolved == {"sensor.test1_energy", "sensor.test2_energy"}
+
+
+async def test_shared_subgroup_resolved_for_both_parents(hass: HomeAssistant) -> None:
+    """Two groups sharing the same subgroup must both include its entities."""
+    shared_entry = await create_mock_group_entry(
+        hass,
+        "Shared",
+        {
+            CONF_GROUP_POWER_ENTITIES: ["sensor.shared_power"],
+            CONF_IGNORE_UNAVAILABLE_STATE: True,
+        },
+    )
+    parent_entries = [
+        await create_mock_group_entry(
+            hass,
+            name,
+            {
+                CONF_GROUP_POWER_ENTITIES: [power_entity],
+                CONF_SUB_GROUPS: [shared_entry.entry_id],
+                CONF_IGNORE_UNAVAILABLE_STATE: True,
+            },
+        )
+        for name, power_entity in (("ParentA", "sensor.test1_power"), ("ParentB", "sensor.test2_power"))
+    ]
+
+    for parent_entry, power_entity in zip(parent_entries, ("sensor.test1_power", "sensor.test2_power"), strict=True):
+        resolved = await resolve_entity_ids_recursively(hass, parent_entry, SensorDeviceClass.POWER)
+        assert resolved == {power_entity, "sensor.shared_power"}
 
 
 async def test_parent_group_reloaded_on_subgroup_update(hass: HomeAssistant) -> None:
@@ -932,6 +996,39 @@ async def test_disable_extended_attributes(hass: HomeAssistant) -> None:
     energy_state = hass.states.get("sensor.testgroup_energy")
     assert ATTR_ENTITIES not in energy_state.attributes
     assert ATTR_IS_GROUP not in energy_state.attributes
+
+
+@pytest.mark.parametrize("force_calculate_energy", [False, True])
+async def test_global_entity_category_applied_to_group(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    force_calculate_energy: bool,
+) -> None:
+    """Group sensors created from the GUI should follow the global sensor categories."""
+    await run_powercalc_setup(
+        hass,
+        {},
+        {
+            CONF_POWER_SENSOR_CATEGORY: EntityCategory.DIAGNOSTIC,
+            CONF_ENERGY_SENSOR_CATEGORY: EntityCategory.DIAGNOSTIC,
+        },
+    )
+
+    await create_mock_group_entry(
+        hass,
+        "GroupA",
+        {
+            CONF_GROUP_POWER_ENTITIES: ["sensor.a_power"],
+            CONF_GROUP_ENERGY_ENTITIES: ["sensor.a_energy"],
+            CONF_FORCE_CALCULATE_GROUP_ENERGY: force_calculate_energy,
+        },
+    )
+
+    power_entry = entity_registry.async_get("sensor.groupa_power")
+    assert power_entry.entity_category == EntityCategory.DIAGNOSTIC
+
+    energy_entry = entity_registry.async_get("sensor.groupa_energy")
+    assert energy_entry.entity_category == EntityCategory.DIAGNOSTIC
 
 
 async def test_associate_entry_to_existing_group(hass: HomeAssistant) -> None:

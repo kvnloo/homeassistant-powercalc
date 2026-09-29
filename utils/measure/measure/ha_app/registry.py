@@ -5,6 +5,9 @@ from measure.const import MEASURE_TYPE_LABELS, MeasureType
 from measure.controller.charging.const import ChargingDeviceType
 from measure.controller.charging.spec import charging_entity_domain
 from measure.controller.light.const import LutMode
+from measure.profile.device_type import PROFILE_DEVICE_DOMAINS, ProfileDeviceType
+from measure.request import RecorderProfileRecipe, RecorderPurpose
+from measure.start import MEASUREMENT_STARTS
 
 
 class FieldControl(StrEnum):
@@ -35,8 +38,11 @@ class FieldOption:
     value: str
     label: str
     entity_domain: str | None = None
+    entity_domains: tuple[str, ...] = ()
     #: Measurement parameters that only apply while this option is selected.
     enables: tuple[str, ...] = ()
+    description: str = ""
+    guidance: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -57,11 +63,25 @@ class FormFieldDefinition:
     maximum: int | float | None = None
     #: Whether several entities can be selected for this field at once.
     multiple: bool = False
+    #: Whether a separate toggle switches this field between one and several entities.
+    multiple_toggle: bool = False
+    #: Ask for a Home Assistant device before offering its entities.
+    group_by_device: bool = False
     #: Label to use while several entities are selected.
     plural_label: str = ""
     #: Entity field whose number of selected entities this count follows by default.
     derived_from: str | None = None
     hint: str = ""
+    #: Other field values required for this field to be shown.
+    visible_when: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: Load the full Home Assistant entity catalog rather than one supported controller domain.
+    all_entities: bool = False
+    entity_device_classes: tuple[str, ...] = ()
+    #: Entity field whose Home Assistant device should be preferred or required.
+    related_to: str | None = None
+    same_device_only: bool = False
+    #: Restate this field on the review screen.
+    review: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,9 +108,6 @@ class MeasurementDefinition:
     measure_type: MeasureType
     description: str
     icon: str
-    confirmation_action: str | None = None
-    #: Present the confirmation as a warning, for a measurement that makes noise or mess.
-    confirmation_is_warning: bool = False
     #: Placeholders steering the profile fields, taken from real entries in the profile library.
     model_id_example: str = ""
     product_name_example: str = ""
@@ -99,10 +116,39 @@ class MeasurementDefinition:
     parameters: tuple[ParameterDefinition, ...] = ()
     supports_profile: bool = True
     supports_resume: bool = False
+    supports_dummy_controller: bool = True
 
     @property
     def label(self) -> str:
         return MEASURE_TYPE_LABELS[self.measure_type]
+
+    @property
+    def confirmation_action(self) -> str:
+        return MEASUREMENT_STARTS[self.measure_type].action
+
+    @property
+    def confirmation_is_warning(self) -> bool:
+        return MEASUREMENT_STARTS[self.measure_type].is_warning
+
+    @property
+    def confirmation_guidance(self) -> tuple[str, ...]:
+        return MEASUREMENT_STARTS[self.measure_type].guidance
+
+    @property
+    def confirmation_eyebrow(self) -> str:
+        return MEASUREMENT_STARTS[self.measure_type].eyebrow
+
+    @property
+    def confirmation_title(self) -> str:
+        return MEASUREMENT_STARTS[self.measure_type].title
+
+    @property
+    def confirmation_guidance_title(self) -> str:
+        return MEASUREMENT_STARTS[self.measure_type].guidance_title
+
+    @property
+    def confirmation_guidance_label(self) -> str:
+        return MEASUREMENT_STARTS[self.measure_type].guidance_label
 
 
 def _controller(
@@ -111,6 +157,8 @@ def _controller(
     *domains: str,
     narrowed_by: str | None = None,
     multiple: bool = False,
+    multiple_toggle: bool = False,
+    group_by_device: bool = False,
     plural_label: str = "",
 ) -> FormFieldDefinition:
     """Entity field that selects the device being measured, and becomes the request controller."""
@@ -122,6 +170,8 @@ def _controller(
         narrowed_by=narrowed_by,
         entity_domains=domains,
         multiple=multiple,
+        multiple_toggle=multiple_toggle,
+        group_by_device=group_by_device,
         plural_label=plural_label,
     )
 
@@ -266,7 +316,9 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
         parameters=LIGHT_PARAMETERS,
         fields=(
             POWER_FIELD,
-            _controller("light_entity_id", "Light", "light", multiple=True, plural_label="Lights"),
+            _controller(
+                "light_entity_id", "Light", "light", multiple=True, multiple_toggle=True, plural_label="Lights"
+            ),
             MODES_FIELD,
             FormFieldDefinition(
                 name="multiple_light_count",
@@ -287,8 +339,6 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
         icon="🔊",
         model_id_example="B7W64E",
         product_name_example="Amazon Echo Dot (Gen4)",
-        confirmation_action="Start speaker measurement",
-        confirmation_is_warning=True,
         parameters=(
             READING_INTERVAL,
             ParameterDefinition(name="sleep_standby", label="Standby stabilization (seconds)", group=SAMPLING),
@@ -307,17 +357,170 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
     ),
     MeasureType.RECORDER: MeasurementDefinition(
         measure_type=MeasureType.RECORDER,
-        description="Record live power readings to a CSV file until cancelled.",
+        description="Record power readings, optionally together with Home Assistant entity states.",
         icon="⏺",
-        confirmation_action="Start recording",
         parameters=(READING_INTERVAL, *POINT_SAMPLING),
         fields=(
             POWER_FIELD,
             FormFieldDefinition(
-                name="export_filename",
-                label="Export filename",
-                control=FieldControl.TEXT,
-                default="record.csv",
+                name="recorder_purpose",
+                label="What do you want to create?",
+                control=FieldControl.SELECT,
+                options=(
+                    FieldOption(
+                        value=RecorderPurpose.PLAYBOOK,
+                        label="A Playbook CSV",
+                        description="Record power readings in the two-column format used to build a playbook.",
+                    ),
+                    FieldOption(
+                        value=RecorderPurpose.COMPLEX_PROFILE,
+                        label="Data for a complex power profile (experimental)",
+                        description=(
+                            "This experimental workflow records JSON Lines source data. Generic devices can create "
+                            "a fixed states_power model or a composite from a secondary signal; vacuums can create "
+                            "activity-based composite profiles with "
+                            "battery charging calibration. For generic devices, record every relevant state for at "
+                            "least five samples in each of two separate runs, using Record more after the first. "
+                            "For vacuums, repeat every activity in at least two independent episodes."
+                        ),
+                    ),
+                ),
+                default=RecorderPurpose.PLAYBOOK,
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="profile_recipe",
+                label="Recording recipe",
+                control=FieldControl.SELECT,
+                options=(
+                    FieldOption(
+                        value=RecorderProfileRecipe.GENERIC,
+                        label="Generic device",
+                        description="Choose the entities whose states may explain changes in power.",
+                    ),
+                    FieldOption(
+                        value=RecorderProfileRecipe.VACUUM_ROBOT,
+                        label="Robot vacuum",
+                        description=("Capture the vacuum, its battery level, and suggested dock or activity entities."),
+                        guidance=(
+                            "Measure the complete dock or base station at the wall outlet.",
+                            "Select every entity that could explain a change in power consumption.",
+                            "Include a low-battery charging cycle and idle and cleaning states.",
+                            "Also capture washing, drying, and dust-emptying when the dock supports them.",
+                        ),
+                    ),
+                ),
+                default=RecorderProfileRecipe.GENERIC,
+                visible_when=(("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="profile_device_type",
+                label="Profile device type",
+                control=FieldControl.SELECT,
+                options=tuple(
+                    FieldOption(
+                        value=device_type,
+                        label=device_type.replace("_", " ").capitalize(),
+                        entity_domains=PROFILE_DEVICE_DOMAINS[device_type],
+                    )
+                    for device_type in (
+                        ProfileDeviceType.AIR_PURIFIER,
+                        ProfileDeviceType.CAMERA,
+                        ProfileDeviceType.FAN,
+                        ProfileDeviceType.HEATING,
+                        ProfileDeviceType.PRINTER,
+                        ProfileDeviceType.SET_TOP_BOX,
+                    )
+                ),
+                default=ProfileDeviceType.AIR_PURIFIER,
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.GENERIC,)),
+                ),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="primary_entity_id",
+                label="Primary entity",
+                control=FieldControl.ENTITY,
+                all_entities=True,
+                narrowed_by="profile_device_type",
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.GENERIC,)),
+                ),
+                hint="The device entity the generated power profile will be attached to.",
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="tracked_entity_ids",
+                label="Additional power signal",
+                plural_label="Additional power signals (optional)",
+                control=FieldControl.ENTITY,
+                required=False,
+                multiple=True,
+                all_entities=True,
+                related_to="primary_entity_id",
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.GENERIC,)),
+                ),
+                hint=(
+                    "The primary entity's state and attributes are analysed automatically. Select other entities "
+                    "whose states may explain power changes, such as a day/night sensor. Library profiles need "
+                    "an unambiguous reference to each selected signal on the device or a related device."
+                ),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="vacuum_entity_id",
+                label="Vacuum",
+                control=FieldControl.ENTITY,
+                entity_domains=("vacuum",),
+                all_entities=True,
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.VACUUM_ROBOT,)),
+                ),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="battery_entity_id",
+                label="Battery level sensor",
+                control=FieldControl.ENTITY,
+                entity_device_classes=("battery",),
+                all_entities=True,
+                related_to="vacuum_entity_id",
+                same_device_only=True,
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.VACUUM_ROBOT,)),
+                ),
+                hint=(
+                    "PowerCalc vacuum profiles require a numeric battery percentage sensor on the same Home Assistant "
+                    "device."
+                ),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="additional_entity_ids",
+                label="Additional entity",
+                plural_label="Additional entities (optional)",
+                control=FieldControl.ENTITY,
+                required=False,
+                multiple=True,
+                all_entities=True,
+                related_to="vacuum_entity_id",
+                visible_when=(
+                    ("recorder_purpose", (RecorderPurpose.COMPLEX_PROFILE,)),
+                    ("profile_recipe", (RecorderProfileRecipe.VACUUM_ROBOT,)),
+                ),
+                hint=(
+                    "Known activity entities are selected automatically, including linked dock washing, drying and "
+                    "auto-empty states. You can change the selection or add other relevant entities."
+                ),
+                review=True,
             ),
         ),
         supports_profile=False,
@@ -326,7 +529,6 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
         measure_type=MeasureType.AVERAGE,
         description="Measure average power for a fixed duration.",
         icon="📊",
-        confirmation_action="Start averaging",
         parameters=(READING_INTERVAL,),
         fields=(
             POWER_FIELD,
@@ -347,7 +549,6 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
         icon="🔋",
         model_id_example="s6_maxv",
         product_name_example="Roborock S6 MaxV",
-        confirmation_action="Start charging measurement",
         parameters=(READING_INTERVAL, *POINT_SAMPLING),
         fields=(
             POWER_FIELD,
@@ -361,17 +562,12 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                         label="Vacuum robot",
                         entity_domain=charging_entity_domain(ChargingDeviceType.VACUUM_ROBOT),
                     ),
-                    FieldOption(
-                        value=ChargingDeviceType.LAWN_MOWER_ROBOT,
-                        label="Lawn mower robot",
-                        entity_domain=charging_entity_domain(ChargingDeviceType.LAWN_MOWER_ROBOT),
-                    ),
                 ),
             ),
             _controller(
                 "charging_entity_id",
                 "Charging device",
-                *(charging_entity_domain(device_type) for device_type in ChargingDeviceType),
+                charging_entity_domain(ChargingDeviceType.VACUUM_ROBOT),
                 narrowed_by="charging_device_type",
             ),
         ),
@@ -384,6 +580,56 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
         product_name_example="Dyson Purifier Cool TP07",
         parameters=(READING_INTERVAL,),
         fields=(POWER_FIELD, _controller("fan_entity_id", "Fan", "fan")),
+    ),
+    MeasureType.SMART_SWITCH: MeasurementDefinition(
+        measure_type=MeasureType.SMART_SWITCH,
+        description="Measure a smart switch's own power use as relays turn off and on.",
+        icon="mdi:toggle-switch",
+        model_id_example="SHSW-25",
+        product_name_example="Shelly 2.5",
+        parameters=(READING_INTERVAL,),
+        supports_dummy_controller=False,
+        fields=(
+            POWER_FIELD,
+            _controller(
+                "switch_entity_id", "Relay", "switch", multiple=True, group_by_device=True, plural_label="Relays"
+            ),
+            FormFieldDefinition(
+                name="power_monitoring",
+                label="The smart switch has built-in power monitoring",
+                control=FieldControl.BOOLEAN,
+                default=False,
+                hint=(
+                    "Enable this when the switch reports its own load power. The generated profile will then "
+                    "set only_self_usage so it does not duplicate the built-in meter."
+                ),
+                review=True,
+            ),
+            FormFieldDefinition(
+                name="samples_per_state",
+                label="Readings per relay state",
+                control=FieldControl.NUMBER,
+                default=12,
+                minimum=5,
+                maximum=100,
+            ),
+            FormFieldDefinition(
+                name="repeat_cycles",
+                label="Measurement cycles",
+                control=FieldControl.NUMBER,
+                default=3,
+                minimum=2,
+                maximum=5,
+            ),
+            FormFieldDefinition(
+                name="settle_seconds",
+                label="Relay settle time (seconds)",
+                control=FieldControl.NUMBER,
+                default=5,
+                minimum=0,
+                maximum=120,
+            ),
+        ),
     ),
 }
 

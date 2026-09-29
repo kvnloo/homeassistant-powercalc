@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -8,6 +8,13 @@ from measure.powermeter.spec import POWER_ENTITY_PATTERN
 from measure.tuning import MeasurementParameters
 
 _DEFAULTS = MeasurementParameters()
+
+type AppPowerMeterType = Literal[
+    PowerMeterType.HASS,
+    PowerMeterType.SHELLY,
+    PowerMeterType.KASA,
+    PowerMeterType.DUMMY,
+]
 
 
 def _bounded_field(name: str, default: float) -> Any:  # noqa: ANN401  # typed as Any so assignments match the field's type, like pydantic's Field()
@@ -34,11 +41,16 @@ class AppPreferences(BaseModel):
 
     default_power_entity_id: str | None = Field(default=None, pattern=POWER_ENTITY_PATTERN)
     default_measure_device: str | None = Field(default=None, max_length=200)
-    power_meter: PowerMeterType = PowerMeterType.HASS
+    default_measure_device_firmware: str | None = Field(default=None, max_length=200)
+    default_contributor_name: str | None = Field(default=None, max_length=200)
+    default_contributor_github: str | None = Field(default=None, max_length=100)
+    default_contributor_email: str | None = Field(default=None, max_length=200)
+    power_meter: AppPowerMeterType = PowerMeterType.HASS
     shelly_ip: str | None = Field(default=None, max_length=255)
     shelly_username: str = Field(default="admin", min_length=1, max_length=50)
     kasa_ip: str | None = Field(default=None, max_length=255)
     fast_test_mode: bool = False
+    allow_zero_power: bool = False
     measurement_defaults: AppMeasurementDefaults = Field(default_factory=AppMeasurementDefaults)
 
 
@@ -47,6 +59,9 @@ class AppSettingsUpdate(AppPreferences):
 
     shelly_password: str | None = Field(default=None, max_length=255)
     clear_shelly_password: bool = False
+    tapo_username: str | None = Field(default=None, max_length=255)
+    tapo_password: str | None = Field(default=None, max_length=255)
+    clear_tapo_credentials: bool = False
 
     def preferences(self) -> AppPreferences:
         return AppPreferences.model_validate(self.model_dump())
@@ -56,3 +71,4 @@ class AppSettingsResponse(AppPreferences):
     """Public settings state which never returns the Shelly password."""
 
     shelly_password_configured: bool = False
+    tapo_credentials_configured: bool = False
